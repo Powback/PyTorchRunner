@@ -1,5 +1,6 @@
 """
 Fixed Script Execution API with Live Output Streaming
+git: 9f5d1c6
 """
 import asyncio
 import os
