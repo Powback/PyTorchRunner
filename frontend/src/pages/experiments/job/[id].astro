@@ -1,0 +1,116 @@
+---
+import Layout from '../../../layouts/Layout.astro';
+import ExperimentDashboard from '../../../components/pytorch/ExperimentDashboard.tsx';
+
+// Enable server-side rendering for dynamic routes
+export const prerender = false;
+
+// Get job ID from URL parameters
+const { id } = Astro.params;
+---
+
+<Layout title={`Job ${id}`}>
+  <div class="py-10">
+    <header>
+      <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+        <div class="sm:flex sm:items-center sm:justify-between">
+          <div>
+            <nav class="flex" aria-label="Breadcrumb">
+              <ol role="list" class="flex items-center space-x-4">
+                <li>
+                  <div>
+                    <a href="/" class="text-gray-400 hover:text-gray-500">
+                      <svg class="h-5 w-5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25" />
+                      </svg>
+                      <span class="sr-only">Home</span>
+                    </a>
+                  </div>
+                </li>
+                <li>
+                  <div class="flex items-center">
+                    <svg class="h-5 w-5 flex-shrink-0 text-gray-400" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+                    </svg>
+                    <a href="/jobs" class="ml-4 text-sm font-medium text-gray-500 hover:text-gray-700">Jobs</a>
+                  </div>
+                </li>
+                <li>
+                  <div class="flex items-center">
+                    <svg class="h-5 w-5 flex-shrink-0 text-gray-400" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+                    </svg>
+                    <span class="ml-4 text-sm font-medium text-gray-900">{id?.slice(0, 8)}...</span>
+                  </div>
+                </li>
+              </ol>
+            </nav>
+            <h1 class="mt-2 text-3xl font-bold leading-tight tracking-tight text-gray-900">
+              Job Monitoring
+            </h1>
+            <p class="mt-2 text-sm text-gray-600">
+              Real-time monitoring of job execution with live output and metrics
+            </p>
+          </div>
+          <div class="mt-4 sm:mt-0 sm:flex sm:space-x-3">
+            <a
+              href="/jobs"
+              class="inline-flex items-center justify-center rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-sm ring-1 ring-inset ring-gray-300 hover:bg-gray-50"
+            >
+              <svg class="mr-2 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 17.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
+              </svg>
+              All Jobs
+            </a>
+            <button
+              id="share-btn"
+              class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            >
+              <svg class="mr-2 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M7.217 10.907a2.25 2.25 0 100 2.186m0-2.186c.18.324.283.696.283 1.093s-.103.77-.283 1.093m0-2.186l9.566-5.314m-9.566 7.5l9.566 5.314m0 0a2.25 2.25 0 103.935 2.186 2.25 2.25 0 00-3.935-2.186zm0-12.814a2.25 2.25 0 103.935-2.186 2.25 2.25 0 00-3.935 2.186z" />
+              </svg>
+              Share Job
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <div class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <ExperimentDashboard client:only="react" jobId={id} autoRefresh={true} />
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const jobId = window.location.pathname.split('/').pop();
+
+    document.getElementById('share-btn')?.addEventListener('click', () => {
+      const url = window.location.href;
+
+      if (navigator.share) {
+        navigator.share({
+          title: `PyTorchRunner Job ${jobId?.slice(0, 8)}`,
+          text: 'Check out this PyTorch training job',
+          url: url
+        }).catch(console.error);
+      } else {
+        navigator.clipboard.writeText(url).then(() => {
+          const btn = document.getElementById('share-btn');
+          if (!btn) return;
+          const originalText = btn.innerHTML;
+          btn.innerHTML = `
+            <svg class="mr-2 h-4 w-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+            </svg>
+            Copied!
+          `;
+          setTimeout(() => { btn.innerHTML = originalText; }, 2000);
+        }).catch(() => {
+          alert(`Share this job: ${url}`);
+        });
+      }
+    });
+  </script>
+</Layout>

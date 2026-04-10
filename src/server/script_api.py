@@ -11,6 +11,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List, AsyncGenerator
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import torch
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 # In-memory job storage
 jobs_db = {}
+# Track subprocess processes for cancellation
+processes_db: Dict[str, asyncio.subprocess.Process] = {}
 
 # Max bytes to keep in preview fields (backward compat)
 PREVIEW_MAX_BYTES = 2000
@@ -36,6 +39,13 @@ class ScriptExecutionRequest(BaseModel):
     job_name: Optional[str] = None
 
 app = FastAPI(title="PyTorchRunner Script Executor", version="2.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/run")
 async def run_script(request: ScriptExecutionRequest, background_tasks: BackgroundTasks):
@@ -156,6 +166,58 @@ async def stream_job_output(job_id: str, since_line: int = 0):
         }
     )
 
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a running job by killing its subprocess."""
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs_db[job_id]
+    if job["status"] != "running":
+        return {"job_id": job_id, "status": job["status"], "message": "Job not running"}
+
+    proc = processes_db.get(job_id)
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+
+    job["status"] = "cancelled"
+    job["exit_code"] = -9
+    job["completed_at"] = datetime.utcnow().isoformat()
+    job["updated_at"] = datetime.utcnow().isoformat()
+    job["error"] = "Cancelled by user"
+    processes_db.pop(job_id, None)
+    logger.info(f"Job {job_id} cancelled")
+    return {"job_id": job_id, "status": "cancelled"}
+
+
+@app.post("/jobs/cancel_all")
+async def cancel_all_jobs():
+    """Cancel ALL running jobs."""
+    cancelled = []
+    for job_id, job in jobs_db.items():
+        if job["status"] == "running":
+            proc = processes_db.get(job_id)
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            job["status"] = "cancelled"
+            job["exit_code"] = -9
+            job["completed_at"] = datetime.utcnow().isoformat()
+            job["updated_at"] = datetime.utcnow().isoformat()
+            job["error"] = "Cancelled by user (cancel_all)"
+            processes_db.pop(job_id, None)
+            cancelled.append(job_id)
+    logger.info(f"Cancelled {len(cancelled)} jobs")
+    return {"cancelled": len(cancelled), "job_ids": cancelled}
+
+
 @app.get("/health")
 async def health_check():
     mps_available = torch.backends.mps.is_available()
@@ -166,7 +228,7 @@ async def health_check():
         "mps_available": mps_available,
         "queue_size": len([j for j in jobs_db.values() if j["status"] == "queued"]),
         "active_jobs": len([j for j in jobs_db.values() if j["status"] == "running"]),
-        "api_version": "2.1.0"
+        "api_version": "2.2.0"
     }
 
 
@@ -248,6 +310,8 @@ async def execute_script(job_id: str):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        # Store process for cancellation
+        processes_db[job_id] = process
 
         # Stream stdout and stderr concurrently in real-time
         await asyncio.gather(
@@ -270,6 +334,7 @@ async def execute_script(job_id: str):
         if exit_code != 0 and stderr_text:
             job_data["error"] = stderr_text[-500:]
 
+        processes_db.pop(job_id, None)
         logger.info(f"Job {job_id} completed with exit code {exit_code}, "
                     f"stdout={len(stdout_lines)} lines, stderr={len(stderr_lines)} lines")
 
