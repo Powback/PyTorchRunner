@@ -1,0 +1,13 @@
+# Test dependencies for PyTorchRunner
+# Install with: pip install -r requirements-test.txt
+
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
+httpx>=0.25.0          # Required by FastAPI TestClient
+fakeredis[aioredis]>=2.20.0  # In-memory Redis for unit tests
+aioresponses>=0.7.6    # Mock aiohttp calls in client tests
+aiosqlite>=0.19.0      # Already in runtime; needed here for unit isolation
+
+# Dev utilities
+pytest-cov>=4.1.0      # Coverage reporting
