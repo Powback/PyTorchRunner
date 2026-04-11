@@ -163,6 +163,30 @@ async def _startup():
     await _db.connect()
     await _metrics_store.connect()
     await _artifact_store.initialize()
+
+    # Reconcile ghost jobs — any job still marked "running" in the persistent
+    # DB is a leftover from a previous server session.  The subprocess is gone
+    # so they can never be cancelled or monitored; mark them cancelled now so
+    # clients don't poll forever.
+    now = datetime.utcnow().isoformat()
+    stale_jobs = await job_store.list_jobs(status="running")
+    if stale_jobs:
+        for stale in stale_jobs:
+            await job_store.update_job(
+                stale["job_id"],
+                {
+                    "status": "cancelled",
+                    "exit_code": -1,
+                    "completed_at": now,
+                    "updated_at": now,
+                    "error": "Server restarted during execution",
+                },
+            )
+        logger.warning(
+            "Reconciled %d stale running job(s) as cancelled on startup",
+            len(stale_jobs),
+        )
+
     logger.info(
         "PyTorchRunner Script Executor ready (sqlite=%s, postgres=%s, redis=%s)",
         job_store.db_path,
