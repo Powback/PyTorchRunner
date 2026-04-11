@@ -2,9 +2,12 @@
  * PyTorchRunner Analytics Dashboard
  * High-level overview of all experiments: performance trends, top runs,
  * metric distributions, and hyperparameter impact analysis.
+ *
+ * Data source: real jobs fetched from the backend API via Powsync bridge.
+ * No mock data — charts reflect actual training history.
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Bar, Line, Scatter } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -22,52 +25,52 @@ import {
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, ScatterController, Title, Tooltip, Legend, Filler);
 
+import { pytorchAPI } from '../../lib/pytorch/api-client';
 import type { PyTorchExperiment } from '../../types/pytorch';
 
-// ── Mock data factory (replace with Powsync query) ──────────────────────────
+// ── Transform raw job record to PyTorchExperiment shape ───────────────────────
 
-function generateMockExperiments(count = 12): PyTorchExperiment[] {
-  const statuses: PyTorchExperiment['status'][] = ['completed', 'completed', 'completed', 'failed', 'running', 'cancelled'];
-  const modelTypes = ['ResNet-50', 'BERT-base', 'ViT-B/16', 'EfficientNet', 'GPT-2 small', 'MobileNet'];
-  const now = Date.now();
+function transformJob(job: any): PyTorchExperiment {
+  const createdAt = job.created_at ? new Date(job.created_at).getTime() : Date.now();
+  const startedAt = job.started_at ? new Date(job.started_at).getTime() : 0;
+  const completedAt = job.completed_at ? new Date(job.completed_at).getTime() : 0;
 
-  return Array.from({ length: count }, (_, i) => {
-    const lrExp = -(Math.random() * 3 + 1); // 1e-4 to 1e-1
-    const lr = parseFloat(Math.pow(10, lrExp).toFixed(6));
-    const bs = [16, 32, 64, 128][Math.floor(Math.random() * 4)];
-    const epochsTotal = Math.floor(Math.random() * 40 + 10);
-    const accuracy = 0.7 + Math.random() * 0.27;
-    const loss = 0.05 + Math.random() * 0.5;
-    const duration = Math.floor(Math.random() * 7200000 + 600000); // 10min–2hr
-    const status = statuses[Math.floor(Math.random() * statuses.length)];
-    const startedAt = now - (count - i) * 86400000 * 0.5 - duration;
+  // env_vars may carry hyperparameters set by the submitter
+  const envVars: Record<string, any> = typeof job.env_vars === 'object' && job.env_vars
+    ? job.env_vars
+    : {};
 
-    return {
-      id: i + 1,
-      name: `${modelTypes[i % modelTypes.length]} Run ${i + 1}`,
-      description: `${modelTypes[i % modelTypes.length]} — LR ${lr}, BS ${bs}`,
-      status,
-      projectId: 1,
-      createdBy: 'user',
-      createdAt: startedAt - 5000,
-      startedAt,
-      completedAt: status === 'running' ? 0 : startedAt + duration,
-      config: { hyperparameters: { learning_rate: lr, batch_size: bs, epochs: epochsTotal } },
-      hyperparameters: { learning_rate: lr, batch_size: bs, epochs: epochsTotal, weight_decay: 1e-4 },
-      metrics: {
-        loss: Array.from({ length: epochsTotal }, (_, ep) => Math.max(0.02, loss * Math.exp(-ep * 0.08) + (Math.random() - 0.5) * 0.02)),
-        accuracy: Array.from({ length: epochsTotal }, (_, ep) => Math.min(0.99, accuracy * (1 - Math.exp(-ep * 0.1)) + Math.random() * 0.01)),
-      },
-      finalMetrics: status === 'completed' ? { loss, accuracy, val_loss: loss * 1.1, val_accuracy: accuracy * 0.97 } : {},
-      modelPath: '',
-      checkpointPath: '',
-      logPath: '',
-      tags: `${modelTypes[i % modelTypes.length].toLowerCase().replace(/\s/g, '-')},run-${i + 1}`,
-      notes: '',
-      parentExperimentId: 0,
-    };
-  });
+  // metrics_summary holds the last known values per metric (populated by
+  // _store_metrics as metrics are detected from stdout / metrics.jsonl)
+  const finalMetrics: Record<string, number> =
+    typeof job.metrics_summary === 'object' && job.metrics_summary
+      ? job.metrics_summary
+      : {};
+
+  return {
+    id: job.id ?? Date.now(),
+    name: job.job_name || `job-${(job.job_id ?? '').slice(0, 8)}`,
+    description: job.script || '',
+    status: job.status ?? 'queued',
+    projectId: 0,
+    createdBy: job.namespace || 'default',
+    createdAt,
+    startedAt,
+    completedAt,
+    config: {},
+    hyperparameters: envVars,
+    metrics: {},  // time-series data not included in list view
+    finalMetrics,
+    modelPath: '',
+    checkpointPath: '',
+    logPath: '',
+    tags: Array.isArray(job.tags) ? job.tags.join(',') : (job.tags || ''),
+    notes: '',
+    parentExperimentId: 0,
+  };
 }
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const STATUS_COLORS: Record<string, string> = {
   completed: 'bg-green-100 text-green-800',
@@ -75,28 +78,55 @@ const STATUS_COLORS: Record<string, string> = {
   failed:    'bg-red-100 text-red-800',
   cancelled: 'bg-gray-100 text-gray-700',
   draft:     'bg-yellow-100 text-yellow-800',
+  queued:    'bg-purple-100 text-purple-800',
 };
 
 const CHART_COLORS = [
-  'rgba(99, 102, 241, 0.8)',   // indigo
-  'rgba(34, 197, 94, 0.8)',    // green
-  'rgba(239, 68, 68, 0.8)',    // red
-  'rgba(245, 158, 11, 0.8)',   // amber
-  'rgba(168, 85, 247, 0.8)',   // purple
-  'rgba(59, 130, 246, 0.8)',   // blue
+  'rgba(99, 102, 241, 0.8)',
+  'rgba(34, 197, 94, 0.8)',
+  'rgba(239, 68, 68, 0.8)',
+  'rgba(245, 158, 11, 0.8)',
+  'rgba(168, 85, 247, 0.8)',
+  'rgba(59, 130, 246, 0.8)',
 ];
 
 type SortKey = 'accuracy' | 'loss' | 'duration' | 'created';
 
+// ── Component ─────────────────────────────────────────────────────────────────
+
 export function AnalyticsDashboard() {
-  const [experiments] = useState<PyTorchExperiment[]>(() => generateMockExperiments(12));
-  const [sortKey, setSortKey] = useState<SortKey>('accuracy');
+  const [experiments, setExperiments] = useState<PyTorchExperiment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [sortKey, setSortKey] = useState<SortKey>('created');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [activeTab, setActiveTab] = useState<'overview' | 'trends' | 'hyperparams' | 'leaderboard'>('overview');
 
+  // ── Fetch real data from the backend ─────────────────────────────────
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+
+    pytorchAPI
+      .listExperiments({ limit: 100 })
+      .then(jobs => {
+        if (mounted) setExperiments(jobs.map(transformJob));
+      })
+      .catch(err => {
+        if (mounted) setError(err instanceof Error ? err.message : 'Failed to load experiments');
+      })
+      .finally(() => {
+        if (mounted) setLoading(false);
+      });
+
+    return () => { mounted = false; };
+  }, []);
+
   const completed = experiments.filter(e => e.status === 'completed');
 
-  // ── Summary statistics ────────────────────────────────────────────────────
+  // ── Summary statistics ────────────────────────────────────────────────
 
   const summary = useMemo(() => {
     const byStatus = experiments.reduce((acc, e) => {
@@ -107,8 +137,8 @@ export function AnalyticsDashboard() {
     const accuracies = completed.map(e => e.finalMetrics.accuracy ?? 0).filter(Boolean);
     const losses = completed.map(e => e.finalMetrics.loss ?? 0).filter(Boolean);
     const durations = completed
-      .filter(e => e.completedAt > 0)
-      .map(e => (e.completedAt - e.startedAt) / 60000); // minutes
+      .filter(e => e.completedAt > 0 && e.startedAt > 0)
+      .map(e => (e.completedAt - e.startedAt) / 60000);
 
     return {
       total: experiments.length,
@@ -120,7 +150,7 @@ export function AnalyticsDashboard() {
     };
   }, [experiments, completed]);
 
-  // ── Filtered + sorted experiments ─────────────────────────────────────────
+  // ── Filtered + sorted experiments ─────────────────────────────────────
 
   const displayExperiments = useMemo(() => {
     let list = statusFilter === 'all' ? experiments : experiments.filter(e => e.status === statusFilter);
@@ -135,7 +165,7 @@ export function AnalyticsDashboard() {
     });
   }, [experiments, sortKey, statusFilter]);
 
-  // ── Accuracy over time (trend) ────────────────────────────────────────────
+  // ── Accuracy over time (trend) ────────────────────────────────────────
 
   const trendChartData = useMemo(() => {
     const sorted = [...completed].sort((a, b) => a.startedAt - b.startedAt);
@@ -165,7 +195,7 @@ export function AnalyticsDashboard() {
     };
   }, [completed]);
 
-  // ── Status breakdown bar chart ────────────────────────────────────────────
+  // ── Status breakdown bar chart ────────────────────────────────────────
 
   const statusChartData = {
     labels: Object.keys(summary.byStatus),
@@ -183,38 +213,25 @@ export function AnalyticsDashboard() {
     }],
   };
 
-  // ── LR vs Accuracy scatter ────────────────────────────────────────────────
+  // ── Loss trend (if available) ─────────────────────────────────────────
 
-  const lrScatterData = {
-    datasets: [{
-      label: 'LR vs Accuracy',
-      data: completed.map(e => ({
-        x: Math.log10(e.hyperparameters.learning_rate as number ?? 1e-3),
-        y: (e.finalMetrics.accuracy ?? 0) * 100,
-      })),
-      backgroundColor: 'rgba(99, 102, 241, 0.6)',
-      pointRadius: 7,
-      pointHoverRadius: 9,
-    }],
-  };
-
-  const lrScatterOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    scales: {
-      x: { title: { display: true, text: 'log₁₀(Learning Rate)' } },
-      y: { title: { display: true, text: 'Accuracy (%)' }, min: 0, max: 100 },
-    },
-    plugins: {
-      legend: { display: false },
-      title: { display: true, text: 'Learning Rate vs Final Accuracy' },
-      tooltip: {
-        callbacks: {
-          label: (ctx: any) => `LR: 1e${ctx.parsed.x.toFixed(1)}, Acc: ${ctx.parsed.y.toFixed(1)}%`,
-        },
-      },
-    },
-  };
+  const lossTrendData = useMemo(() => {
+    const sorted = [...completed]
+      .filter(e => e.finalMetrics.loss)
+      .sort((a, b) => a.startedAt - b.startedAt);
+    return {
+      labels: sorted.map(e => new Date(e.startedAt).toLocaleDateString()),
+      datasets: [{
+        label: 'Final Loss',
+        data: sorted.map(e => e.finalMetrics.loss ? +e.finalMetrics.loss.toFixed(4) : null),
+        borderColor: 'rgb(239, 68, 68)',
+        backgroundColor: 'rgba(239, 68, 68, 0.1)',
+        tension: 0.3,
+        fill: true,
+        pointRadius: 5,
+      }],
+    };
+  }, [completed]);
 
   const trendOptions = {
     responsive: true,
@@ -243,13 +260,43 @@ export function AnalyticsDashboard() {
     return h > 0 ? `${h}h ${m}m` : `${m}m`;
   };
 
+  // ── Loading / error states ────────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <div className="text-center">
+          <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-indigo-600 border-r-transparent" />
+          <p className="mt-3 text-sm text-gray-500">Loading experiment data…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-lg bg-red-50 border border-red-200 p-6 text-center">
+        <p className="text-sm font-medium text-red-800">Failed to load experiments</p>
+        <p className="mt-1 text-xs text-red-600">{error}</p>
+        <button
+          onClick={() => window.location.reload()}
+          className="mt-3 text-xs text-red-700 underline hover:no-underline"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────
+
   return (
     <div className="space-y-6">
       {/* KPI cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         {[
           { label: 'Total Experiments', value: summary.total, sub: `${summary.byStatus.running ?? 0} running`, color: 'indigo' },
-          { label: 'Best Accuracy', value: summary.bestAccuracy ? `${(summary.bestAccuracy * 100).toFixed(1)}%` : '—', sub: summary.avgAccuracy ? `avg ${(summary.avgAccuracy * 100).toFixed(1)}%` : '', color: 'green' },
+          { label: 'Best Accuracy', value: summary.bestAccuracy ? `${(summary.bestAccuracy * 100).toFixed(1)}%` : '—', sub: summary.avgAccuracy ? `avg ${(summary.avgAccuracy * 100).toFixed(1)}%` : 'no accuracy data', color: 'green' },
           { label: 'Best Loss', value: summary.bestLoss ? summary.bestLoss.toFixed(4) : '—', sub: `${summary.byStatus.completed ?? 0} completed`, color: 'blue' },
           { label: 'Avg Duration', value: summary.avgDuration ? `${summary.avgDuration.toFixed(0)}m` : '—', sub: `${summary.byStatus.failed ?? 0} failed`, color: 'purple' },
         ].map(card => (
@@ -261,203 +308,187 @@ export function AnalyticsDashboard() {
         ))}
       </div>
 
-      {/* Tab navigation */}
-      <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg overflow-hidden">
-        <div className="border-b border-gray-200">
-          <div className="flex -mb-px">
-            {(['overview', 'trends', 'hyperparams', 'leaderboard'] as const).map(tab => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                className={`px-5 py-3 text-sm font-medium capitalize border-b-2 transition-colors ${
-                  activeTab === tab
-                    ? 'border-indigo-500 text-indigo-600'
-                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                }`}
-              >
-                {tab}
-              </button>
-            ))}
+      {/* Empty state */}
+      {experiments.length === 0 && (
+        <div className="rounded-lg bg-gray-50 border border-gray-200 p-10 text-center">
+          <p className="text-sm font-medium text-gray-700">No experiments yet</p>
+          <p className="mt-1 text-xs text-gray-500">
+            Submit a training job and metrics will appear here in real-time.
+          </p>
+        </div>
+      )}
+
+      {experiments.length > 0 && (
+        <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg overflow-hidden">
+          {/* Tab navigation */}
+          <div className="border-b border-gray-200">
+            <div className="flex -mb-px">
+              {(['overview', 'trends', 'leaderboard'] as const).map(tab => (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  className={`px-5 py-3 text-sm font-medium capitalize border-b-2 transition-colors ${
+                    activeTab === tab
+                      ? 'border-indigo-500 text-indigo-600'
+                      : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                  }`}
+                >
+                  {tab}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="p-6">
+            {/* ── Overview ── */}
+            {activeTab === 'overview' && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="h-64">
+                  {Object.keys(summary.byStatus).length > 0
+                    ? <Bar data={statusChartData} options={statusOptions} />
+                    : <p className="text-sm text-gray-400 text-center pt-20">No status data</p>
+                  }
+                </div>
+                <div className="h-64">
+                  {completed.length > 0
+                    ? <Line data={trendChartData} options={trendOptions} />
+                    : <div className="flex items-center justify-center h-full">
+                        <p className="text-sm text-gray-400">No completed experiments yet</p>
+                      </div>
+                  }
+                </div>
+              </div>
+            )}
+
+            {/* ── Trends ── */}
+            {activeTab === 'trends' && (
+              <div className="space-y-6">
+                {completed.some(e => e.finalMetrics.accuracy) ? (
+                  <div className="h-80">
+                    <Line data={trendChartData} options={{ ...trendOptions, maintainAspectRatio: false }} />
+                  </div>
+                ) : null}
+
+                {completed.some(e => e.finalMetrics.loss) ? (
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-900 mb-3">Loss Trend</h3>
+                    <div className="h-64">
+                      <Line
+                        data={lossTrendData}
+                        options={{
+                          responsive: true,
+                          maintainAspectRatio: false,
+                          scales: { y: { title: { display: true, text: 'Loss' }, beginAtZero: false } },
+                          plugins: { legend: { display: false }, title: { display: true, text: 'Final Loss Over Runs' } },
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+
+                {!completed.some(e => e.finalMetrics.accuracy || e.finalMetrics.loss) && (
+                  <div className="text-center py-12 text-gray-400">
+                    <p className="text-sm">No metric data yet.</p>
+                    <p className="text-xs mt-1">
+                      Metrics are collected automatically from training script output.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── Leaderboard ── */}
+            {activeTab === 'leaderboard' && (
+              <div className="space-y-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <div>
+                    <label className="text-xs font-medium text-gray-500 mr-2">Sort by</label>
+                    <select
+                      value={sortKey}
+                      onChange={e => setSortKey(e.target.value as SortKey)}
+                      className="text-sm rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    >
+                      <option value="created">Most Recent</option>
+                      <option value="accuracy">Best Accuracy</option>
+                      <option value="loss">Best Loss</option>
+                      <option value="duration">Duration</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-gray-500 mr-2">Status</label>
+                    <select
+                      value={statusFilter}
+                      onChange={e => setStatusFilter(e.target.value)}
+                      className="text-sm rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    >
+                      <option value="all">All</option>
+                      <option value="completed">Completed</option>
+                      <option value="running">Running</option>
+                      <option value="failed">Failed</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto rounded-lg ring-1 ring-gray-200">
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase w-8">#</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Experiment</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Status</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Accuracy</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Loss</th>
+                        <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Duration</th>
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tags</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 bg-white">
+                      {displayExperiments.map((exp, rank) => (
+                        <tr key={exp.id} className={`hover:bg-gray-50 ${rank === 0 ? 'bg-indigo-50/40' : ''}`}>
+                          <td className="px-4 py-3 text-gray-400 font-mono text-xs">
+                            {rank === 0 && sortKey === 'accuracy' ? '🏆' : rank + 1}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="font-medium text-gray-900 truncate max-w-[200px]">{exp.name}</div>
+                            <div className="text-xs text-gray-400 truncate max-w-[200px]">{exp.description}</div>
+                          </td>
+                          <td className="px-4 py-3 text-center">
+                            <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[exp.status] ?? ''}`}>
+                              {exp.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-center font-semibold text-gray-900">
+                            {exp.finalMetrics.accuracy
+                              ? `${(exp.finalMetrics.accuracy * 100).toFixed(1)}%`
+                              : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-center font-mono text-gray-700">
+                            {exp.finalMetrics.loss ? exp.finalMetrics.loss.toFixed(4) : '—'}
+                          </td>
+                          <td className="px-4 py-3 text-center text-gray-500 text-xs">
+                            {exp.completedAt > 0 && exp.startedAt > 0
+                              ? fmtDur(exp.completedAt - exp.startedAt)
+                              : exp.status === 'running' ? 'in progress' : '—'}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex flex-wrap gap-1">
+                              {(exp.tags || '').split(',').filter(Boolean).slice(0, 3).map(tag => (
+                                <span key={tag} className="inline-flex px-1.5 py-0.5 text-xs bg-gray-100 text-gray-600 rounded">
+                                  {tag.trim()}
+                                </span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
         </div>
-
-        <div className="p-6">
-          {/* ── Overview ── */}
-          {activeTab === 'overview' && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="h-64">
-                <Bar data={statusChartData} options={statusOptions} />
-              </div>
-              <div className="h-64">
-                <Line data={trendChartData} options={trendOptions} />
-              </div>
-            </div>
-          )}
-
-          {/* ── Trends ── */}
-          {activeTab === 'trends' && (
-            <div className="space-y-6">
-              <div className="h-80">
-                <Line data={trendChartData} options={{ ...trendOptions, maintainAspectRatio: false }} />
-              </div>
-
-              {/* Per-epoch performance for top-3 experiments */}
-              <div>
-                <h3 className="text-sm font-semibold text-gray-900 mb-3">Top 3 Runs — Training Curves</h3>
-                <div className="h-64">
-                  <Line
-                    data={{
-                      datasets: [...completed]
-                        .sort((a, b) => (b.finalMetrics.accuracy ?? 0) - (a.finalMetrics.accuracy ?? 0))
-                        .slice(0, 3)
-                        .map((exp, i) => ({
-                          label: exp.name,
-                          data: (exp.metrics.accuracy ?? []).map((y, x) => ({ x, y: y * 100 })),
-                          borderColor: ['rgb(99,102,241)', 'rgb(34,197,94)', 'rgb(245,158,11)'][i],
-                          backgroundColor: ['rgba(99,102,241,0.1)', 'rgba(34,197,94,0.1)', 'rgba(245,158,11,0.1)'][i],
-                          tension: 0.3,
-                          pointRadius: 0,
-                          fill: true,
-                        })),
-                    }}
-                    options={{
-                      responsive: true,
-                      maintainAspectRatio: false,
-                      animation: false as any,
-                      scales: {
-                        x: { title: { display: true, text: 'Epoch' }, type: 'linear' as const },
-                        y: { title: { display: true, text: 'Accuracy (%)' }, min: 0, max: 100 },
-                      },
-                      plugins: { legend: { position: 'top' as const } },
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── Hyperparameters ── */}
-          {activeTab === 'hyperparams' && (
-            <div className="space-y-6">
-              <div className="h-72">
-                <Scatter data={lrScatterData} options={{ ...lrScatterOptions, maintainAspectRatio: false }} />
-              </div>
-
-              <div>
-                <h3 className="text-sm font-semibold text-gray-900 mb-3">Batch Size vs Accuracy</h3>
-                <div className="h-52">
-                  <Bar
-                    data={{
-                      labels: [16, 32, 64, 128].map(String),
-                      datasets: [{
-                        label: 'Avg Accuracy (%)',
-                        data: [16, 32, 64, 128].map(bs => {
-                          const exps = completed.filter(e => e.hyperparameters.batch_size === bs);
-                          if (!exps.length) return 0;
-                          return +(exps.reduce((s, e) => s + (e.finalMetrics.accuracy ?? 0), 0) / exps.length * 100).toFixed(1);
-                        }),
-                        backgroundColor: CHART_COLORS,
-                        borderRadius: 4,
-                      }],
-                    }}
-                    options={{
-                      responsive: true,
-                      maintainAspectRatio: false,
-                      scales: { y: { title: { display: true, text: 'Accuracy (%)' }, min: 0, max: 100, beginAtZero: false } },
-                      plugins: { legend: { display: false }, title: { display: true, text: 'Batch Size vs Average Accuracy' } },
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── Leaderboard ── */}
-          {activeTab === 'leaderboard' && (
-            <div className="space-y-4">
-              {/* Filters */}
-              <div className="flex flex-wrap items-center gap-3">
-                <div>
-                  <label className="text-xs font-medium text-gray-500 mr-2">Sort by</label>
-                  <select
-                    value={sortKey}
-                    onChange={e => setSortKey(e.target.value as SortKey)}
-                    className="text-sm rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-                  >
-                    <option value="accuracy">Best Accuracy</option>
-                    <option value="loss">Best Loss</option>
-                    <option value="duration">Duration</option>
-                    <option value="created">Most Recent</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-medium text-gray-500 mr-2">Status</label>
-                  <select
-                    value={statusFilter}
-                    onChange={e => setStatusFilter(e.target.value)}
-                    className="text-sm rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-                  >
-                    <option value="all">All</option>
-                    <option value="completed">Completed</option>
-                    <option value="running">Running</option>
-                    <option value="failed">Failed</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="overflow-x-auto rounded-lg ring-1 ring-gray-200">
-                <table className="min-w-full text-sm">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase w-8">#</th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Experiment</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Status</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Accuracy</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Loss</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">LR</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">BS</th>
-                      <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">Duration</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100 bg-white">
-                    {displayExperiments.map((exp, rank) => (
-                      <tr key={exp.id} className={`hover:bg-gray-50 ${rank === 0 ? 'bg-indigo-50/40' : ''}`}>
-                        <td className="px-4 py-3 text-gray-400 font-mono text-xs">
-                          {rank === 0 ? '🏆' : rank + 1}
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-gray-900 truncate max-w-[200px]">{exp.name}</div>
-                          <div className="text-xs text-gray-400 truncate max-w-[200px]">{exp.description}</div>
-                        </td>
-                        <td className="px-4 py-3 text-center">
-                          <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[exp.status] ?? ''}`}>
-                            {exp.status}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-center font-semibold text-gray-900">
-                          {exp.finalMetrics.accuracy ? `${(exp.finalMetrics.accuracy * 100).toFixed(1)}%` : '—'}
-                        </td>
-                        <td className="px-4 py-3 text-center font-mono text-gray-700">
-                          {exp.finalMetrics.loss ? exp.finalMetrics.loss.toFixed(4) : '—'}
-                        </td>
-                        <td className="px-4 py-3 text-center font-mono text-xs text-gray-600">
-                          {exp.hyperparameters.learning_rate ? (exp.hyperparameters.learning_rate as number).toExponential(1) : '—'}
-                        </td>
-                        <td className="px-4 py-3 text-center text-gray-600">
-                          {exp.hyperparameters.batch_size ?? '—'}
-                        </td>
-                        <td className="px-4 py-3 text-center text-gray-500 text-xs">
-                          {exp.completedAt > 0 ? fmtDur(exp.completedAt - exp.startedAt) : exp.status === 'running' ? 'in progress' : '—'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      )}
     </div>
   );
 }

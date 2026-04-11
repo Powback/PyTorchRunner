@@ -1,12 +1,14 @@
 """
-Script Execution API for PyTorchRunner  — v3.1.0
+Script Execution API for PyTorchRunner  — v3.2.0
 Persistent job history, namespace support, safe multi-agent cancellation,
-and comprehensive storage: PostgreSQL experiments, Redis metrics, artifact files.
+comprehensive storage: PostgreSQL experiments, Redis metrics, artifact files,
+and real-time metrics pipeline: stdout detection → DB → SSE metrics events.
 """
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -26,6 +28,65 @@ from ..storage.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Metrics detection — parse training metrics from stdout lines
+# ---------------------------------------------------------------------------
+
+# Require at least one known metric keyword before attempting kv extraction
+_METRIC_KW_RE = re.compile(
+    r'\b(loss|acc(?:uracy)?|reward|lr|learning[_\s]rate|val[_\s]?loss|val[_\s]?acc|'
+    r'train[_\s]?loss|train[_\s]?acc|perplexity|ppl|f1|precision|recall|mae|mse|rmse|'
+    r'score|bleu|rouge|kl|entropy|grad[_\s]?norm|throughput)\b',
+    re.IGNORECASE,
+)
+# key=value or key: value with a numeric float (including scientific notation)
+_KV_RE = re.compile(
+    r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*[=:]\s*(-?[0-9]+\.?[0-9]*(?:[eE][+\-]?[0-9]+)?)\b'
+)
+
+
+def _detect_metrics_in_line(line: str) -> Optional[Dict[str, float]]:
+    """
+    Extract named numeric metrics from a single stdout line.
+
+    Returns {name: value} (including step/epoch if present) or None.
+    Only triggers on lines that either:
+      1. Are a pure JSON object, OR
+      2. Contain at least one recognised metric keyword (loss, acc, reward, …)
+    This avoids false positives on lines like "Running pid=12345 port=8080".
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    # ── 1. Pure JSON object ───────────────────────────────────────────────
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            data = json.loads(line)
+            result = {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+            if result:
+                return result
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # ── 2. key=value / key: value line with a metric keyword ─────────────
+    if not _METRIC_KW_RE.search(line):
+        return None
+
+    pairs = _KV_RE.findall(line)
+    if not pairs:
+        return None
+
+    result = {}
+    for name, val in pairs:
+        try:
+            result[name] = float(val)
+        except ValueError:
+            pass
+
+    return result or None
+
 
 # ---------------------------------------------------------------------------
 # In-memory state (active session)
@@ -289,6 +350,7 @@ async def stream_job_output(job_id: str, since_line: int = 0):
         job = jobs_db[job_id]
         sent_stdout = since_line
         sent_stderr = 0
+        sent_metrics = 0  # cursor into job["_metrics_events"]
 
         yield _sse_event({"type": "status", "status": job["status"], "job_id": job_id})
 
@@ -311,7 +373,18 @@ async def stream_job_output(job_id: str, since_line: int = 0):
                 )
                 sent_stderr += 1
 
+            # Emit structured metrics events (from stdout detection + file watcher)
+            metrics_events = job.get("_metrics_events", [])
+            while sent_metrics < len(metrics_events):
+                yield _sse_event(metrics_events[sent_metrics])
+                sent_metrics += 1
+
             if job.get("status") in ("completed", "failed", "cancelled"):
+                # Flush any remaining metrics before the done event
+                metrics_events = job.get("_metrics_events", [])
+                while sent_metrics < len(metrics_events):
+                    yield _sse_event(metrics_events[sent_metrics])
+                    sent_metrics += 1
                 yield _sse_event(
                     {
                         "type": "done",
@@ -319,6 +392,7 @@ async def stream_job_output(job_id: str, since_line: int = 0):
                         "exit_code": job.get("exit_code"),
                         "stdout_lines": len(stdout_lines),
                         "stderr_lines": len(stderr_lines),
+                        "metrics_count": sent_metrics,
                     }
                 )
                 break
@@ -505,6 +579,85 @@ def _kill_process(job_id: str):
             pass
 
 
+async def _store_metrics(job_id: str, metrics: Dict[str, float], step: Optional[int]) -> None:
+    """
+    Persist detected metrics to PostgreSQL and Redis (fire-and-forget).
+    Also updates the in-memory metrics_summary for the job so the /jobs
+    list endpoint reflects the latest values without a DB round-trip.
+    """
+    try:
+        await _experiment_store.record_metrics_batch(job_id, metrics, step=step)
+        await _metrics_store.record_metrics_dict(job_id, metrics, step=step)
+        await _experiment_store.update_metrics_summary(job_id, metrics)
+        # Mirror into in-memory job so /jobs endpoint shows live metrics
+        if job_id in jobs_db:
+            jobs_db[job_id].setdefault("metrics_summary", {}).update(metrics)
+    except Exception as exc:
+        logger.debug("_store_metrics error for job %s: %s", job_id, exc)
+
+
+async def _read_metrics_file_chunk(
+    job_id: str,
+    metrics_path: str,
+    job_data: dict,
+    offset: int,
+) -> int:
+    """
+    Read any new JSONL lines from *metrics_path* starting at *offset*.
+    Returns the new file offset.
+
+    Each line must be a JSON object.  Keys ``step``, ``epoch``,
+    ``timestamp`` are used as coordinates, not stored as metric values.
+    """
+    if not os.path.exists(metrics_path):
+        return offset
+    try:
+        with open(metrics_path, "r", errors="replace") as fh:
+            fh.seek(offset)
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                    step = data.pop("step", None)
+                    epoch = data.pop("epoch", None)
+                    data.pop("timestamp", None)
+                    metrics = {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+                    if metrics:
+                        s = int(step) if step is not None else None
+                        asyncio.create_task(_store_metrics(job_id, metrics, s))
+                        evt: Dict[str, Any] = {"type": "metrics", "metrics": metrics}
+                        if s is not None:
+                            evt["step"] = s
+                        if epoch is not None:
+                            evt["epoch"] = int(epoch)
+                        job_data.setdefault("_metrics_events", []).append(evt)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass
+            return fh.tell()
+    except OSError as exc:
+        logger.debug("Metrics file read error for job %s: %s", job_id, exc)
+        return offset
+
+
+async def _watch_metrics_file(job_id: str, metrics_path: str, job_data: dict) -> None:
+    """
+    Tail *metrics_path* while a job is running, emitting metrics events
+    for every new JSONL line.  Exits cleanly when the job finishes and
+    does one final read to capture any last-second writes.
+    """
+    offset = 0
+    while True:
+        offset = await _read_metrics_file_chunk(job_id, metrics_path, job_data, offset)
+        status = job_data.get("status", "running")
+        if status in ("completed", "failed", "cancelled"):
+            # Final pass — capture any metrics written between last poll and process exit
+            await _read_metrics_file_chunk(job_id, metrics_path, job_data, offset)
+            break
+        await asyncio.sleep(0.5)
+
+
 def _sse_event(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -516,7 +669,13 @@ async def _read_stream(
     field_prefix: str,
 ):
     """Read lines from an async stream, updating job_data incrementally.
-    Also buffers output to Redis Streams for replay (fire-and-forget)."""
+
+    For stdout lines:
+    - Buffers to Redis Streams for replay (fire-and-forget)
+    - Detects metrics via JSON or key=value patterns and stores them
+      asynchronously to PostgreSQL + Redis, then appends a ``metrics``
+      event to ``job_data["_metrics_events"]`` for SSE emission.
+    """
     job_id = job_data["job_id"]
     while True:
         try:
@@ -540,9 +699,24 @@ async def _read_stream(
         job_data[f"{field_prefix}_line_count"] = len(lines_list)
         job_data["updated_at"] = datetime.utcnow().isoformat()
 
-        # Buffer to Redis Streams for output replay
         if field_prefix == "stdout":
             asyncio.create_task(_metrics_store.append_stdout(job_id, line))
+            # ── Metrics detection ─────────────────────────────────────────
+            detected = _detect_metrics_in_line(line.rstrip())
+            if detected:
+                # Separate coordinate keys from metric values
+                step_val = detected.pop("step", None)
+                epoch_val = detected.pop("epoch", None)
+                detected.pop("timestamp", None)
+                if detected:  # still has metric values after popping coords
+                    step = int(step_val) if step_val is not None else None
+                    asyncio.create_task(_store_metrics(job_id, detected, step))
+                    evt: Dict[str, Any] = {"type": "metrics", "metrics": detected}
+                    if step is not None:
+                        evt["step"] = step
+                    if epoch_val is not None:
+                        evt["epoch"] = int(epoch_val)
+                    job_data.setdefault("_metrics_events", []).append(evt)
         else:
             asyncio.create_task(_metrics_store.append_stderr(job_id, line))
 
@@ -577,6 +751,15 @@ async def execute_script(job_id: str):
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
 
+        # ── Metrics file sidecar ──────────────────────────────────────────
+        # Scripts can write JSONL metrics to this path for high-frequency
+        # or structured metrics without cluttering stdout.
+        # Example: {"loss": 0.312, "accuracy": 0.876, "step": 100}
+        metrics_dir = f"/tmp/pytorchrunner/{job_id}"
+        os.makedirs(metrics_dir, exist_ok=True)
+        metrics_file = os.path.join(metrics_dir, "metrics.jsonl")
+        env["PYTORCHRUNNER_METRICS"] = metrics_file
+
         cmd = [sys.executable, "-u", job_data["script"]] + job_data["args"]
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -587,12 +770,24 @@ async def execute_script(job_id: str):
         )
         processes_db[job_id] = process
 
+        # Start metrics file watcher as a background task so it can keep
+        # tailing after streams close (scripts may flush file after exit)
+        metrics_watcher = asyncio.create_task(
+            _watch_metrics_file(job_id, metrics_file, job_data)
+        )
+
         await asyncio.gather(
             _read_stream(process.stdout, stdout_lines, job_data, "stdout"),
             _read_stream(process.stderr, stderr_lines, job_data, "stderr"),
         )
 
         await process.wait()
+        # Let the file watcher do its final pass (it exits once status is set)
+        # We cancel after a short grace period in case the task is stuck
+        try:
+            await asyncio.wait_for(metrics_watcher, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            metrics_watcher.cancel()
         exit_code = process.returncode
         processes_db.pop(job_id, None)
 

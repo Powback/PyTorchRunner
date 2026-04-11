@@ -146,6 +146,40 @@ class PyTorchAPIClient {
   // ============================================================================
 
   /**
+   * List jobs / experiments with optional filters.
+   * Returns raw job records from the backend.
+   */
+  async listExperiments(params?: {
+    status?: string;
+    namespace?: string;
+    limit?: number;
+  }): Promise<any[]> {
+    const q = new URLSearchParams();
+    if (params?.status) q.set('status', params.status);
+    if (params?.namespace) q.set('namespace', params.namespace);
+    if (params?.limit) q.set('limit', String(params.limit));
+    const qs = q.toString() ? `?${q}` : '';
+    const resp = await fetch(`${this.scriptApiUrl}/jobs${qs}`);
+    if (!resp.ok) throw new Error(`Failed to list experiments: ${resp.statusText}`);
+    const data = await resp.json();
+    return data.jobs ?? [];
+  }
+
+  /**
+   * Fetch historical metrics for an experiment from PostgreSQL.
+   * Returns { metricName: [{value, step, recorded_at}] }
+   */
+  async getExperimentMetrics(
+    experimentId: string,
+    metricName?: string,
+  ): Promise<Record<string, Array<{ value: number; step?: number; recorded_at: string }>>> {
+    const q = metricName ? `?metric_name=${encodeURIComponent(metricName)}` : '';
+    const resp = await fetch(`${this.scriptApiUrl}/experiments/${experimentId}/metrics${q}`);
+    if (!resp.ok) throw new Error(`Failed to get metrics: ${resp.statusText}`);
+    return resp.json();
+  }
+
+  /**
    * Submit a training job
    */
   async submitTraining(config: {
