@@ -679,11 +679,9 @@ async def _read_stream(
 ):
     """Read lines from an async stream, updating job_data incrementally.
 
-    For stdout lines:
-    - Buffers to Redis Streams for replay (fire-and-forget)
-    - Detects metrics via JSON or key=value patterns and stores them
-      asynchronously to PostgreSQL + Redis, then appends a ``metrics``
-      event to ``job_data["_metrics_events"]`` for SSE emission.
+    Buffers output to Redis Streams for replay (fire-and-forget).
+    Metrics are NOT parsed from stdout — use MetricsLogger / PYTORCHRUNNER_METRICS
+    for structured metric ingestion so different script formats all work reliably.
 
     Yields the event loop on every iteration so the uvicorn HTTP server
     stays responsive during heavy MPS workloads that produce rapid output.
@@ -713,22 +711,6 @@ async def _read_stream(
 
         if field_prefix == "stdout":
             asyncio.create_task(_metrics_store.append_stdout(job_id, line))
-            # ── Metrics detection ─────────────────────────────────────────
-            detected = _detect_metrics_in_line(line.rstrip())
-            if detected:
-                # Separate coordinate keys from metric values
-                step_val = detected.pop("step", None)
-                epoch_val = detected.pop("epoch", None)
-                detected.pop("timestamp", None)
-                if detected:  # still has metric values after popping coords
-                    step = int(step_val) if step_val is not None else None
-                    asyncio.create_task(_store_metrics(job_id, detected, step))
-                    evt: Dict[str, Any] = {"type": "metrics", "metrics": detected}
-                    if step is not None:
-                        evt["step"] = step
-                    if epoch_val is not None:
-                        evt["epoch"] = int(epoch_val)
-                    job_data.setdefault("_metrics_events", []).append(evt)
         else:
             asyncio.create_task(_metrics_store.append_stderr(job_id, line))
 
@@ -775,6 +757,7 @@ async def execute_script(job_id: str):
         os.makedirs(metrics_dir, exist_ok=True)
         metrics_file = os.path.join(metrics_dir, "metrics.jsonl")
         env["PYTORCHRUNNER_METRICS"] = metrics_file
+        env["PYTORCHRUNNER_JOB_ID"] = job_id
 
         cmd = [sys.executable, "-u", job_data["script"]] + job_data["args"]
         process = await asyncio.create_subprocess_exec(
@@ -893,6 +876,30 @@ async def execute_script(job_id: str):
 
         # Set TTL on Redis output streams (auto-cleanup after 24h)
         await _metrics_store.set_experiment_ttl(job_id)
+
+        # Pick up result JSON files written by the training script
+        # Scans: {cwd}/results/*.json and {cwd}/out/results/*.json
+        cwd = job_data.get("cwd", "")
+        if cwd:
+            import glob as _glob
+            result_patterns = [
+                os.path.join(cwd, "results", "*.json"),
+                os.path.join(cwd, "out", "results", "*.json"),
+            ]
+            for pattern in result_patterns:
+                for result_path in _glob.glob(pattern):
+                    try:
+                        file_size = os.path.getsize(result_path)
+                        await _artifact_store._register_artifact(
+                            experiment_id=job_id,
+                            name=os.path.basename(result_path),
+                            artifact_type="result",
+                            file_path=result_path,
+                            file_size=file_size,
+                        )
+                        logger.info("Registered result artifact: %s", result_path)
+                    except Exception as exc:
+                        logger.debug("Failed to register result artifact %s: %s", result_path, exc)
 
         logger.info(
             "Job %s %s (exit=%s, stdout=%d lines, stderr=%d lines)",

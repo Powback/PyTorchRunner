@@ -7,7 +7,7 @@ service, plus a local experiment tracker for metrics and artifacts.
 
 Quick start::
 
-    from pytorch_runner import JobRunner, ExperimentTracker
+    from pytorch_runner import JobRunner, ExperimentTracker, MetricsLogger
 
     # Submit a script and wait for results
     runner = JobRunner(base_url="http://pytorch-api.pow")
@@ -20,6 +20,10 @@ Quick start::
     tracker.log_params({"lr": 0.01, "epochs": 20})
     tracker.log_metrics({"loss": 0.42, "accuracy": 0.91}, step=1)
     tracker.save()
+
+    # Stream real-time metrics from inside a training script
+    metrics = MetricsLogger()   # reads PYTORCHRUNNER_METRICS / PYTORCHRUNNER_JOB_ID
+    metrics.log(step=100, loss=0.312, accuracy=0.876)
 """
 
 from .config import RunnerConfig
@@ -33,6 +37,7 @@ from .exceptions import (
     RetryExhaustedError,
     ServiceUnavailableError,
 )
+from .metrics import MetricsLogger
 from .models import HealthStatus, JobResult, JobStatus, OutputLine
 from .runner import Job, JobRunner
 from .tracker import ExperimentTracker
@@ -42,6 +47,7 @@ __all__ = [
     "JobRunner",
     "Job",
     "ExperimentTracker",
+    "MetricsLogger",
     # Config
     "RunnerConfig",
     # Models

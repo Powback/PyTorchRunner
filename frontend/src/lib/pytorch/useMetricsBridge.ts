@@ -46,63 +46,6 @@ export interface MetricsBridgeState {
   hasExplicitMetrics: boolean;
 }
 
-// ── Metric parsing (frontend fallback) ───────────────────────────────────────
-
-/**
- * Parse metrics from a stdout line.  Used as a fallback when the backend
- * has not yet emitted an explicit "metrics" SSE event for this line
- * (e.g. older backend versions or unrecognised patterns).
- */
-function parseMetricsFromLine(
-  line: string,
-): { metrics: Record<string, number>; step?: number; epoch?: number } | null {
-  const trimmed = line.trim();
-
-  // Pure JSON object
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    try {
-      const data = JSON.parse(trimmed);
-      const metrics: Record<string, number> = {};
-      for (const [k, v] of Object.entries(data)) {
-        if (typeof v === 'number') metrics[k] = v;
-      }
-      if (Object.keys(metrics).length > 0) {
-        const step = typeof metrics.step === 'number' ? metrics.step : undefined;
-        const epoch = typeof metrics.epoch === 'number' ? metrics.epoch : undefined;
-        delete metrics.step;
-        delete metrics.epoch;
-        delete metrics.timestamp;
-        return { metrics, step, epoch };
-      }
-    } catch { /* not valid JSON */ }
-  }
-
-  // Common text patterns: "loss=0.312 step=100" / "Loss: 0.312, Acc: 0.92"
-  const lossMatch = /(?:^|\s)[Ll]oss\s*[=:]\s*([\d.eE+\-]+)/.exec(line);
-  if (lossMatch) {
-    const m: Record<string, number> = { loss: parseFloat(lossMatch[1]) };
-    const acc = /[Aa]cc(?:uracy)?\s*[=:]\s*([\d.]+)/.exec(line);
-    if (acc) m.accuracy = parseFloat(acc[1]);
-    const valLoss = /[Vv]al[_\s][Ll]oss\s*[=:]\s*([\d.eE+\-]+)/.exec(line);
-    if (valLoss) m.val_loss = parseFloat(valLoss[1]);
-    const valAcc = /[Vv]al[_\s][Aa]cc\s*[=:]\s*([\d.]+)/.exec(line);
-    if (valAcc) m.val_accuracy = parseFloat(valAcc[1]);
-    const lr = /\b[Ll][Rr]\s*[=:]\s*([\d.eE+\-]+)/.exec(line);
-    if (lr) m.learningRate = parseFloat(lr[1]);
-    const reward = /[Rr]eward\s*[=:]\s*([\d.eE+\-]+)/.exec(line);
-    if (reward) m.reward = parseFloat(reward[1]);
-    const step = /\b[Ss]tep\s*[=:]\s*(\d+)/.exec(line);
-    const epoch = /\b[Ee]poch\s*[=:]\s*(\d+)/.exec(line);
-    return {
-      metrics: m,
-      step: step ? parseInt(step[1]) : undefined,
-      epoch: epoch ? parseInt(epoch[1]) : undefined,
-    };
-  }
-
-  return null;
-}
-
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 const MAX_OUTPUT_LINES = 500;
@@ -123,7 +66,6 @@ export function useMetricsBridge(
   });
 
   const sseRef = useRef<EventSource | null>(null);
-  const hasExplicitMetricsRef = useRef(false);
 
   // ── Apply a metrics update to local state ─────────────────────────────
 
@@ -180,7 +122,6 @@ export function useMetricsBridge(
         case 'metrics':
           // Explicit structured metrics from the backend pipeline
           if (data.metrics) {
-            hasExplicitMetricsRef.current = true;
             setState(p => ({ ...p, hasExplicitMetrics: true }));
             applyMetricsUpdate({
               metrics: data.metrics,
@@ -205,12 +146,6 @@ export function useMetricsBridge(
                 },
               ].slice(-MAX_OUTPUT_LINES),
             }));
-            // Fallback: parse metrics from stdout only when the backend hasn't
-            // sent an explicit metrics event yet (avoids double-counting)
-            if (!hasExplicitMetricsRef.current && data.type === 'stdout') {
-              const parsed = parseMetricsFromLine(data.line!);
-              if (parsed) applyMetricsUpdate(parsed);
-            }
           }
           break;
 
@@ -263,7 +198,6 @@ export function useMetricsBridge(
 
   useEffect(() => {
     if (!jobId || !autoStart) return;
-    hasExplicitMetricsRef.current = false;
     start();
     return stop;
   }, [jobId, autoStart, start, stop]);
