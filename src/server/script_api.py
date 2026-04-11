@@ -102,6 +102,15 @@ PREVIEW_MAX_BYTES = 2000
 # Max bytes to keep in full output buffers (1 MB per stream)
 FULL_MAX_BYTES = 1_000_000
 
+# ---------------------------------------------------------------------------
+# Job timeout — configurable via env var, defaults to no timeout
+# ---------------------------------------------------------------------------
+# Set PYTORCHRUNNER_JOB_TIMEOUT=<seconds> to impose a per-job wall-clock
+# limit.  Unset (the default) means jobs run until they finish naturally.
+# Example: PYTORCHRUNNER_JOB_TIMEOUT=7200  # 2-hour cap
+_timeout_env = os.environ.get("PYTORCHRUNNER_JOB_TIMEOUT")
+JOB_TIMEOUT: Optional[float] = float(_timeout_env) if _timeout_env else None
+
 # Persistent store (SQLite — lightweight, always available)
 job_store = JobStore()
 
@@ -675,6 +684,9 @@ async def _read_stream(
     - Detects metrics via JSON or key=value patterns and stores them
       asynchronously to PostgreSQL + Redis, then appends a ``metrics``
       event to ``job_data["_metrics_events"]`` for SSE emission.
+
+    Yields the event loop on every iteration so the uvicorn HTTP server
+    stays responsive during heavy MPS workloads that produce rapid output.
     """
     job_id = job_data["job_id"]
     while True:
@@ -719,6 +731,10 @@ async def _read_stream(
                     job_data.setdefault("_metrics_events", []).append(evt)
         else:
             asyncio.create_task(_metrics_store.append_stderr(job_id, line))
+
+        # Yield the event loop so HTTP handlers stay responsive during
+        # heavy MPS workloads that produce rapid output.
+        await asyncio.sleep(0)
 
 
 async def execute_script(job_id: str):
@@ -776,10 +792,46 @@ async def execute_script(job_id: str):
             _watch_metrics_file(job_id, metrics_file, job_data)
         )
 
-        await asyncio.gather(
+        _gather = asyncio.gather(
             _read_stream(process.stdout, stdout_lines, job_data, "stdout"),
             _read_stream(process.stderr, stderr_lines, job_data, "stderr"),
         )
+        try:
+            if JOB_TIMEOUT is not None:
+                await asyncio.wait_for(_gather, timeout=JOB_TIMEOUT)
+            else:
+                await _gather
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Job %s exceeded timeout of %.0fs — terminating process",
+                job_id, JOB_TIMEOUT,
+            )
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                process.kill()
+            now_iso = datetime.utcnow().isoformat()
+            job_data.update(
+                status="failed",
+                progress=0.0,
+                error=f"Job exceeded timeout of {JOB_TIMEOUT:.0f}s",
+                completed_at=now_iso,
+                updated_at=now_iso,
+            )
+            processes_db.pop(job_id, None)
+            await job_store.update_job(
+                job_id,
+                {
+                    "status": "failed",
+                    "progress": 0.0,
+                    "error": job_data["error"],
+                    "completed_at": now_iso,
+                    "updated_at": now_iso,
+                },
+            )
+            metrics_watcher.cancel()
+            return
 
         await process.wait()
         # Let the file watcher do its final pass (it exits once status is set)
