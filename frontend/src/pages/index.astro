@@ -1,0 +1,418 @@
+---
+import Layout from '../layouts/Layout.astro';
+---
+
+<Layout title="Dashboard">
+	<div class="py-10">
+		<header>
+			<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+				<h1 class="text-3xl font-bold leading-tight tracking-tight text-gray-900">
+					PyTorchRunner Dashboard
+				</h1>
+				<p class="mt-2 text-sm text-gray-600">
+					MPS-accelerated PyTorch training and script execution
+				</p>
+			</div>
+		</header>
+		<main>
+			<div class="mx-auto max-w-7xl sm:px-6 lg:px-8">
+				<div class="px-4 py-8 sm:px-0">
+					<!-- Health Status -->
+					<div class="mb-8">
+						<div id="health-status" class="bg-white overflow-hidden shadow-sm ring-1 ring-gray-900/5 rounded-lg">
+							<div class="px-4 py-5 sm:p-6">
+								<h3 class="text-base font-semibold leading-6 text-gray-900">Service Health</h3>
+								<div class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-4">
+									<div class="bg-gray-50 p-4 rounded-lg">
+										<dt class="text-sm font-medium text-gray-500">Status</dt>
+										<dd class="mt-1 text-lg font-semibold text-gray-600" data-health="status">Loading...</dd>
+									</div>
+									<div class="bg-gray-50 p-4 rounded-lg">
+										<dt class="text-sm font-medium text-gray-500">MPS</dt>
+										<dd class="mt-1 text-lg font-semibold text-gray-600" data-health="mps">Loading...</dd>
+									</div>
+									<div class="bg-gray-50 p-4 rounded-lg">
+										<dt class="text-sm font-medium text-gray-500">Queue Size</dt>
+										<dd class="mt-1 text-lg font-semibold text-gray-900" data-health="queue">-</dd>
+									</div>
+									<div class="bg-gray-50 p-4 rounded-lg">
+										<dt class="text-sm font-medium text-gray-500">Active Jobs</dt>
+										<dd class="mt-1 text-lg font-semibold text-gray-900" data-health="active">-</dd>
+									</div>
+								</div>
+							</div>
+						</div>
+					</div>
+
+					<!-- Quick Actions -->
+					<div class="mb-8">
+						<h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Quick Actions</h3>
+						<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+							<div class="relative rounded-lg border border-gray-300 bg-white px-6 py-5 shadow-sm hover:border-gray-400 cursor-pointer" onclick="showJobSubmissionModal()">
+								<div class="flex items-center space-x-3">
+									<div class="flex-shrink-0">
+										<div class="h-10 w-10 rounded-lg bg-indigo-500 flex items-center justify-center">
+											<svg class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+												<path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"></path>
+											</svg>
+										</div>
+									</div>
+									<div class="flex-1 min-w-0">
+										<p class="text-sm font-medium text-gray-900">Submit New Job</p>
+										<p class="text-sm text-gray-500">Quick job submission interface</p>
+									</div>
+								</div>
+							</div>
+							<a href="/experiments" class="relative rounded-lg border border-gray-300 bg-white px-6 py-5 shadow-sm flex items-center space-x-3 hover:border-gray-400">
+								<div class="flex-shrink-0">
+									<div class="h-10 w-10 rounded-lg bg-green-500 flex items-center justify-center">
+										<svg class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+											<path stroke-linecap="round" stroke-linejoin="round" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 14.5M9.75 3.104L19.8 14.5m0 0l-5.25 5.25a2.25 2.25 0 01-1.591.659h-5.714m7.305-5.909l-5.25 5.25a2.25 2.25 0 01-1.591.659h-5.714"></path>
+										</svg>
+									</div>
+								</div>
+								<div class="flex-1 min-w-0">
+									<span class="absolute inset-0" aria-hidden="true"></span>
+									<p class="text-sm font-medium text-gray-900">View Experiments</p>
+									<p class="text-sm text-gray-500">Monitor and compare experiments</p>
+								</div>
+							</a>
+							<a href="/jobs" class="relative rounded-lg border border-gray-300 bg-white px-6 py-5 shadow-sm flex items-center space-x-3 hover:border-gray-400">
+								<div class="flex-shrink-0">
+									<div class="h-10 w-10 rounded-lg bg-orange-500 flex items-center justify-center">
+										<svg class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+											<path stroke-linecap="round" stroke-linejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 17.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"></path>
+										</svg>
+									</div>
+								</div>
+								<div class="flex-1 min-w-0">
+									<span class="absolute inset-0" aria-hidden="true"></span>
+									<p class="text-sm font-medium text-gray-900">View Jobs</p>
+									<p class="text-sm text-gray-500">Monitor active and recent jobs</p>
+								</div>
+							</a>
+						</div>
+					</div>
+
+					<!-- Recent Activity -->
+					<div>
+						<h3 class="text-lg font-medium leading-6 text-gray-900 mb-4">Recent Activity</h3>
+						<div class="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg">
+							<div class="px-4 py-5 sm:p-6">
+								<div id="recent-activity">
+									<div class="text-center py-8">
+										<svg class="mx-auto h-12 w-12 text-gray-400 animate-pulse" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+											<path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99"></path>
+										</svg>
+										<h3 class="mt-2 text-sm font-semibold text-gray-900">Loading recent activity...</h3>
+										<p class="mt-1 text-sm text-gray-500">Fetching job data from API</p>
+									</div>
+								</div>
+							</div>
+						</div>
+					</div>
+
+					<!-- Job Submission Methods -->
+					<div class="mt-8">
+						<div class="bg-blue-50 border border-blue-200 rounded-lg p-6">
+							<h3 class="text-lg font-medium text-blue-900 mb-4">How to Submit Jobs</h3>
+							<div class="space-y-6">
+								<div>
+									<h4 class="font-semibold text-blue-800">1. Quick Web Interface</h4>
+									<p class="text-sm text-blue-700 mb-2">Use the "Submit New Job" button above for a form-based interface</p>
+								</div>
+
+								<div>
+									<h4 class="font-semibold text-blue-800">2. curl (REST API)</h4>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>curl -X POST http://pytorch.pow/api/jobs \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "script": "examples/mlx_example.py",
+    "args": ["--epochs", "10"],
+    "cwd": "/path/to/project",
+    "namespace": "my_experiment"
+  }'</code>`} />
+								</div>
+
+								<div>
+									<h4 class="font-semibold text-blue-800">3. Python SDK</h4>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>import aiohttp
+import asyncio
+
+async def submit_job():
+    async with aiohttp.ClientSession() as session:
+        job_data = {
+            "script": "train.py",
+            "args": ["--lr", "0.01", "--epochs", "100"],
+            "namespace": "my_experiment",
+            "cwd": "/path/to/project"
+        }
+
+        async with session.post(
+            "http://pytorch.pow/api/jobs",
+            json=job_data
+        ) as resp:
+            result = await resp.json()
+            print(f"Job ID: {result['job_id']}")
+
+asyncio.run(submit_job())</code>`} />
+								</div>
+
+								<div>
+									<h4 class="font-semibold text-blue-800">4. SpecLLM Bridge (MLX Jobs)</h4>
+									<p class="text-sm text-blue-700 mb-2">For MLX/Apple Silicon execution:</p>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code># 1. Start MLX runner on the host:
+PYTORCH_RUNNER_API_URL=http://pytorch.pow MLX_RUNNER_NAMESPACE=specllm python mlx_runner.py
+
+# 2. Submit jobs with namespace "specllm":
+curl -X POST http://pytorch.pow/api/jobs \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "script": "mlx_training.py",
+    "args": ["--model", "llama"],
+    "namespace": "specllm",
+    "cwd": "/Users/macback/Projects/SpecLLM"
+  }'</code>`} />
+								</div>
+
+								<div class="bg-blue-100 p-3 rounded">
+									<h5 class="font-medium text-blue-800">Architecture Overview:</h5>
+									<p class="text-sm text-blue-700 mt-1">
+										<strong>API:</strong> Astro server at pytorch.pow handles all /api/* routes<br/>
+										<strong>Runner:</strong> mlx_runner.py runs on host, polls /api/jobs and executes with MPS/MLX<br/>
+										<strong>Single URL:</strong> pytorch.pow for everything — UI + API + dashboard
+									</p>
+								</div>
+							</div>
+						</div>
+					</div>
+				</div>
+			</div>
+		</main>
+	</div>
+
+	<!-- Job Submission Modal -->
+	<div id="job-submission-modal" class="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full hidden">
+		<div class="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white">
+			<div class="mt-3">
+				<div class="flex justify-between items-center mb-4">
+					<h3 class="text-lg font-medium text-gray-900">Submit New Job</h3>
+					<button onclick="hideJobSubmissionModal()" class="text-gray-400 hover:text-gray-600">
+						<svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+							<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"></path>
+						</svg>
+					</button>
+				</div>
+
+				<form id="job-submission-form" class="space-y-4">
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Script Path</label>
+						<input type="text" id="script" required class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="examples/train.py">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Arguments (one per line)</label>
+						<textarea id="args" rows="3" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="--epochs 10&#10;--lr 0.01"></textarea>
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Working Directory</label>
+						<input type="text" id="cwd" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500" placeholder="/path/to/project">
+					</div>
+
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Namespace</label>
+						<select id="namespace" class="mt-1 block w-full border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+							<option value="default">default (Docker)</option>
+							<option value="specllm">specllm (MLX Bridge)</option>
+							<option value="experiments">experiments</option>
+						</select>
+					</div>
+
+					<div class="flex justify-end space-x-3 pt-4">
+						<button type="button" onclick="hideJobSubmissionModal()" class="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50">
+							Cancel
+						</button>
+						<button type="submit" class="px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700">
+							Submit Job
+						</button>
+					</div>
+				</form>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		// API — same origin, no CORS
+		const API_BASE = '/api';
+
+		// Load health status on page load
+		async function loadHealthStatus() {
+			try {
+				console.log('Loading health status from:', API_BASE);
+				const response = await fetch(`${API_BASE}/health`);
+				const health = await response.json();
+
+				// Update health status UI with real data
+				updateHealthDisplay(health);
+
+				// Load recent jobs
+				await loadRecentJobs();
+			} catch (error) {
+				console.error('Failed to load health status:', error);
+				showHealthError();
+			}
+		}
+
+		// Update health status display
+		function updateHealthDisplay(health) {
+			const statusElement = document.querySelector('[data-health="status"]');
+			const mpsElement = document.querySelector('[data-health="mps"]');
+			const queueElement = document.querySelector('[data-health="queue"]');
+			const activeElement = document.querySelector('[data-health="active"]');
+
+			if (statusElement) {
+				statusElement.textContent = health.status;
+				statusElement.className = health.status === 'healthy'
+					? 'mt-1 text-lg font-semibold text-green-600'
+					: 'mt-1 text-lg font-semibold text-red-600';
+			}
+
+			if (mpsElement) {
+				const runnerCount = health.runners?.connected ?? 0;
+				mpsElement.textContent = runnerCount > 0 ? `${runnerCount} runner(s)` : 'No runners';
+				mpsElement.className = runnerCount > 0
+					? 'mt-1 text-lg font-semibold text-green-600'
+					: 'mt-1 text-lg font-semibold text-orange-600';
+			}
+
+			if (queueElement) queueElement.textContent = health.queue_size || 0;
+			if (activeElement) activeElement.textContent = health.active_jobs || 0;
+		}
+
+		// Load recent jobs
+		async function loadRecentJobs() {
+			try {
+				const response = await fetch(`${API_BASE}/jobs?limit=5`);
+				const data = await response.json();
+				updateRecentActivity(data.jobs || []);
+			} catch (error) {
+				console.error('Failed to load recent jobs:', error);
+			}
+		}
+
+		// Update recent activity section
+		function updateRecentActivity(jobs) {
+			const activityContainer = document.querySelector('#recent-activity');
+			if (!activityContainer) return;
+
+			if (jobs.length === 0) {
+				activityContainer.innerHTML = `
+					<div class="text-center py-8">
+						<svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+							<path stroke-linecap="round" stroke-linejoin="round" d="M20.25 14.15v4.25c0 1.094-.787 2.036-1.872 2.18-2.087.277-4.216.42-6.378.42s-4.291-.143-6.378-.42c-1.085-.144-1.872-1.086-1.872-2.18v-4.25m16.5 0a2.18 2.18 0 00.75-1.661V8.706c0-1.081-.768-2.015-1.837-2.175a48.114 48.114 0 00-3.413-.387m4.5 8.006c-.194.165-.42.295-.673.38A23.978 23.978 0 0112 15.75c-2.648 0-5.195-.429-7.577-1.22a2.016 2.016 0 01-.673-.38m0 0A2.18 2.18 0 013 12.489V8.706c0-1.081.768-2.015 1.837-2.175a48.111 48.111 0 013.413-.387m7.5 0V5.25A2.25 2.25 0 0013.5 3h-3a2.25 2.25 0 00-2.25 2.25v.894m7.5 0a48.108 48.108 0 00-7.5 0"></path>
+						</svg>
+						<h3 class="mt-2 text-sm font-semibold text-gray-900">No recent activity</h3>
+						<p class="mt-1 text-sm text-gray-500">Get started by submitting your first job using the methods below.</p>
+					</div>
+				`;
+				return;
+			}
+
+			const jobsList = jobs.map(job => {
+				const statusColor = {
+					'completed': 'text-green-600 bg-green-100',
+					'running': 'text-blue-600 bg-blue-100',
+					'failed': 'text-red-600 bg-red-100',
+					'queued': 'text-yellow-600 bg-yellow-100'
+				}[job.status] || 'text-gray-600 bg-gray-100';
+
+				return `
+					<div class="flex items-center justify-between py-3">
+						<div class="flex-1 min-w-0">
+							<p class="text-sm font-medium text-gray-900 truncate">${job.script || 'Unknown Script'}</p>
+							<p class="text-sm text-gray-500">${job.namespace || 'default'} • ${new Date(job.created_at).toLocaleString()}</p>
+						</div>
+						<div class="flex-shrink-0">
+							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColor}">
+								${job.status}
+							</span>
+						</div>
+					</div>
+				`;
+			}).join('');
+
+			activityContainer.innerHTML = `
+				<div class="divide-y divide-gray-200">
+					${jobsList}
+				</div>
+			`;
+		}
+
+		// Show health error
+		function showHealthError() {
+			const statusElement = document.querySelector('[data-health="status"]');
+			if (statusElement) {
+				statusElement.textContent = 'API Error';
+				statusElement.className = 'mt-1 text-lg font-semibold text-red-600';
+			}
+		}
+
+		// Modal functions
+		function showJobSubmissionModal() {
+			document.getElementById('job-submission-modal').classList.remove('hidden');
+		}
+
+		function hideJobSubmissionModal() {
+			document.getElementById('job-submission-modal').classList.add('hidden');
+		}
+
+		// Job submission
+		document.getElementById('job-submission-form').addEventListener('submit', async (e) => {
+			e.preventDefault();
+
+			const script = document.getElementById('script').value;
+			const argsText = document.getElementById('args').value;
+			const cwd = document.getElementById('cwd').value;
+			const namespace = document.getElementById('namespace').value;
+
+			const args = argsText.trim() ? argsText.trim().split('\n').map(arg => arg.trim()).filter(Boolean) : [];
+
+			const jobData = {
+				script,
+				args,
+				namespace,
+				...(cwd && { cwd })
+			};
+
+			try {
+				const response = await fetch(`${API_BASE}/jobs`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json'
+					},
+					body: JSON.stringify(jobData)
+				});
+
+				if (response.ok) {
+					const result = await response.json();
+					alert(`Job submitted successfully! Job ID: ${result.job_id}`);
+					hideJobSubmissionModal();
+					// Refresh the jobs list
+					loadRecentJobs();
+				} else {
+					const error = await response.json();
+					alert(`Job submission failed: ${error.detail || error.message || 'Unknown error'}`);
+				}
+			} catch (error) {
+				alert(`Job submission failed: ${error.message}`);
+			}
+		});
+
+		// Auto-refresh every 30 seconds
+		setInterval(loadHealthStatus, 30000);
+
+		// Initialize dashboard
+		document.addEventListener('DOMContentLoaded', loadHealthStatus);
+	</script>
+</Layout>

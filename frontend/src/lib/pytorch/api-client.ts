@@ -1,155 +1,35 @@
 /**
  * PyTorchRunner API Client
- * Handles communication with script execution and training APIs
+ * All calls go to same-origin /api/* — no CORS, no cross-origin issues.
  */
 
-import type {
-  PyTorchJob,
-  PyTorchExperiment,
-  HealthStatus,
-  JobConfig,
-  ApiResponse,
-  SSEJobEvent
-} from '../../types/pytorch';
-
 class PyTorchAPIClient {
-  private scriptApiUrl: string;
-  private trainingApiUrl: string;
+  private base = '/api';
 
-  constructor() {
-    // Use external/browser-accessible URLs (pytorch-api.pow) for all client-side API calls.
-    // PUBLIC_SCRIPT_API_URL is the Docker-internal URL (http://script-api:9100) — unusable from the browser.
-    this.scriptApiUrl = import.meta.env.PUBLIC_EXTERNAL_SCRIPT_API || import.meta.env.PUBLIC_SCRIPT_API_URL || 'http://localhost:9100';
-    this.trainingApiUrl = import.meta.env.PUBLIC_EXTERNAL_TRAINING_API || import.meta.env.PUBLIC_TRAINING_API_URL || 'http://localhost:8000';
-  }
+  // ── Jobs ──────────────────────────────────────────────────────────────────
 
-  // ============================================================================
-  // SCRIPT EXECUTION API (Port 9100)
-  // ============================================================================
-
-  /**
-   * Submit a script execution job
-   */
-  async submitScript(config: {
+  async submitJob(config: {
     script: string;
     args?: string[];
-    cwd: string;
+    cwd?: string;
     env_vars?: Record<string, string>;
     job_name?: string;
-  }): Promise<{ job_id: string; status: string }> {
-    const response = await fetch(`${this.scriptApiUrl}/run`, {
+    namespace?: string;
+    tags?: string[];
+  }): Promise<{ job_id: string; status: string; namespace: string }> {
+    const resp = await fetch(`${this.base}/jobs`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(config),
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Script submission failed: ${error}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      throw new Error(err.error || 'Job submission failed');
     }
-
-    return response.json();
+    return resp.json();
   }
 
-  /**
-   * Get job status
-   */
-  async getJobStatus(jobId: string): Promise<PyTorchJob> {
-    const response = await fetch(`${this.scriptApiUrl}/jobs/${jobId}`);
-
-    if (!response.ok) {
-      throw new Error(`Failed to get job status: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-
-    // Transform API response to our interface
-    return {
-      id: Date.now(), // Will be managed by Powsync
-      jobId: data.job_id,
-      experimentId: 0, // Will be linked later
-      type: 'script_execution',
-      status: data.status,
-      progress: data.progress,
-      createdAt: new Date(data.created_at).getTime(),
-      startedAt: data.started_at ? new Date(data.started_at).getTime() : 0,
-      completedAt: data.completed_at ? new Date(data.completed_at).getTime() : 0,
-      config: {
-        type: 'script_execution',
-        script: data.script,
-        args: data.args,
-        cwd: data.cwd,
-        env_vars: data.env_vars,
-      },
-      metrics: {},
-      error: data.error || '',
-      exitCode: data.exit_code || 0,
-      resourceUsage: '',
-    };
-  }
-
-  /**
-   * Cancel a job
-   */
-  async cancelJob(jobId: string): Promise<{ job_id: string; status: string }> {
-    const response = await fetch(`${this.scriptApiUrl}/jobs/${jobId}/cancel`, {
-      method: 'POST',
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to cancel job: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * Cancel all jobs
-   */
-  async cancelAllJobs(): Promise<{ cancelled: number; job_ids: string[] }> {
-    const response = await fetch(`${this.scriptApiUrl}/jobs/cancel_all`, {
-      method: 'POST',
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to cancel jobs: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * Get health status
-   */
-  async getHealthStatus(): Promise<HealthStatus> {
-    const response = await fetch(`${this.scriptApiUrl}/health`);
-
-    if (!response.ok) {
-      throw new Error(`Health check failed: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * Create SSE connection for job output streaming
-   */
-  createJobStream(jobId: string, sinceLine: number = 0): EventSource {
-    const url = `${this.scriptApiUrl}/jobs/${jobId}/stream?since_line=${sinceLine}`;
-    return new EventSource(url);
-  }
-
-  // ============================================================================
-  // TRAINING API (Port 8000) - Future implementation
-  // ============================================================================
-
-  /**
-   * List jobs / experiments with optional filters.
-   * Returns raw job records from the backend.
-   */
-  async listExperiments(params?: {
+  async listJobs(params?: {
     status?: string;
     namespace?: string;
     limit?: number;
@@ -159,90 +39,97 @@ class PyTorchAPIClient {
     if (params?.namespace) q.set('namespace', params.namespace);
     if (params?.limit) q.set('limit', String(params.limit));
     const qs = q.toString() ? `?${q}` : '';
-    const resp = await fetch(`${this.scriptApiUrl}/jobs${qs}`);
-    if (!resp.ok) throw new Error(`Failed to list experiments: ${resp.statusText}`);
+    const resp = await fetch(`${this.base}/jobs${qs}`);
+    if (!resp.ok) throw new Error(`Failed to list jobs: ${resp.statusText}`);
     const data = await resp.json();
     return data.jobs ?? [];
   }
 
-  /**
-   * Fetch historical metrics for an experiment from PostgreSQL.
-   * Returns { metricName: [{value, step, recorded_at}] }
-   */
-  async getExperimentMetrics(
-    experimentId: string,
-    metricName?: string,
-  ): Promise<Record<string, Array<{ value: number; step?: number; recorded_at: string }>>> {
-    const q = metricName ? `?metric_name=${encodeURIComponent(metricName)}` : '';
-    const resp = await fetch(`${this.scriptApiUrl}/experiments/${experimentId}/metrics${q}`);
-    if (!resp.ok) throw new Error(`Failed to get metrics: ${resp.statusText}`);
+  async getJob(jobId: string): Promise<any> {
+    const resp = await fetch(`${this.base}/jobs/${jobId}`);
+    if (!resp.ok) throw new Error(`Job not found: ${jobId}`);
     return resp.json();
   }
 
-  /**
-   * Submit a training job
-   */
-  async submitTraining(config: {
-    ml_model_config: Record<string, any>;
-    training_params: Record<string, any>;
-    data_config: Record<string, any>;
-    project_path?: string;
-    job_name?: string;
-  }): Promise<{ job_id: string; status: string }> {
-    const response = await fetch(`${this.trainingApiUrl}/train`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(config),
+  async cancelJob(jobId: string): Promise<void> {
+    await fetch(`${this.base}/jobs/${jobId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'cancelled' }),
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Training submission failed: ${error}`);
-    }
-
-    return response.json();
   }
 
-  // ============================================================================
-  // UTILITY METHODS
-  // ============================================================================
-
-  /**
-   * Parse SSE event data
-   */
-  parseSSEEvent(event: MessageEvent): SSEJobEvent | null {
-    try {
-      return JSON.parse(event.data) as SSEJobEvent;
-    } catch (error) {
-      console.error('Failed to parse SSE event:', error);
-      return null;
-    }
+  async getJobMetrics(jobId: string): Promise<any[]> {
+    const resp = await fetch(`${this.base}/jobs/${jobId}/metrics`);
+    if (!resp.ok) throw new Error(`Failed to get metrics: ${resp.statusText}`);
+    const data = await resp.json();
+    return data.metrics ?? [];
   }
 
-  /**
-   * Format timestamps for display
-   */
+  // ── Health ────────────────────────────────────────────────────────────────
+
+  async getHealth(): Promise<any> {
+    const resp = await fetch(`${this.base}/health`);
+    if (!resp.ok) throw new Error(`Health check failed: ${resp.statusText}`);
+    return resp.json();
+  }
+
+  // ── Runners ───────────────────────────────────────────────────────────────
+
+  async listRunners(): Promise<any[]> {
+    const resp = await fetch(`${this.base}/runners`);
+    if (!resp.ok) throw new Error(`Failed to list runners: ${resp.statusText}`);
+    const data = await resp.json();
+    return data.runners ?? [];
+  }
+
+  // ── Legacy shims (keep old call sites working) ────────────────────────────
+
+  /** @deprecated use submitJob */
+  async submitScript(config: Parameters<PyTorchAPIClient['submitJob']>[0]) {
+    return this.submitJob(config);
+  }
+
+  /** @deprecated use getJob */
+  async getJobStatus(jobId: string) {
+    return this.getJob(jobId);
+  }
+
+  /** @deprecated use getHealth */
+  async getHealthStatus() {
+    return this.getHealth();
+  }
+
+  /** @deprecated use listJobs */
+  async listExperiments(params?: { status?: string; namespace?: string; limit?: number }) {
+    return this.listJobs(params);
+  }
+
+  /** @deprecated use getJobMetrics */
+  async getExperimentMetrics(jobId: string) {
+    const metrics = await this.getJobMetrics(jobId);
+    // Reshape to old {metricName: [{value, step, recorded_at}]} format
+    const result: Record<string, Array<{ value: number; step?: number; recorded_at: string }>> = {};
+    for (const point of metrics) {
+      for (const [name, value] of Object.entries(point.metrics ?? {})) {
+        if (!result[name]) result[name] = [];
+        result[name].push({ value: value as number, step: point.step, recorded_at: point.recorded_at });
+      }
+    }
+    return result;
+  }
+
   formatTimestamp(timestamp: number): string {
     return new Date(timestamp).toLocaleString();
   }
 
-  /**
-   * Calculate duration between timestamps
-   */
   calculateDuration(startTime: number, endTime: number = Date.now()): string {
-    const duration = endTime - startTime;
-    const minutes = Math.floor(duration / 60000);
-    const seconds = Math.floor((duration % 60000) / 1000);
-
-    if (minutes > 0) {
-      return `${minutes}m ${seconds}s`;
-    }
-    return `${seconds}s`;
+    const d = endTime - startTime;
+    const m = Math.floor(d / 60000);
+    const s = Math.floor((d % 60000) / 1000);
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
   }
 }
 
-// Export singleton instance
 export const pytorchAPI = new PyTorchAPIClient();
 export default pytorchAPI;

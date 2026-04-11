@@ -1,10 +1,11 @@
-# PyTorchRunner Complete Stack
-# Includes script execution API, training API, Redis queue, PostgreSQL, and frontend
+# PyTorchRunner — single API + worker architecture
+# Frontend (Astro) serves EVERYTHING at pytorch.pow: UI + /api/* routes
+# Runner (mlx_runner.py) runs on the host and connects as a worker client
 
 name: pytorch-runner
 
 services:
-  # PostgreSQL — persistent experiment metadata, metrics, artifact index
+  # PostgreSQL — persistent job metadata and metrics
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -25,96 +26,15 @@ services:
       retries: 5
       start_period: 30s
 
-  # Script Execution API (Current implementation)
-  script-api:
-    build: .
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9100:9100"
-    labels:
-      # Enable Traefik
-      - "traefik.enable=true"
-      # Local HTTP router (.pow domain)
-      - "traefik.http.routers.pytorch-script-api.rule=Host(`pytorch-api.pow`)"
-      - "traefik.http.routers.pytorch-script-api.entrypoints=web"
-      - "traefik.http.services.pytorch-script-api.loadbalancer.server.port=9100"
-    networks:
-      - default
-      - traefik
-    volumes:
-      # Mount examples and workspace for script execution
-      - ./examples:/app/examples:rw
-      - ./workspace:/app/workspace:rw
-      # Mount source for development
-      - ./src:/app/src:rw
-      # Preserve Python cache
-      - script-api-cache:/app/src/__pycache__
-      # Artifact storage (persisted across restarts)
-      - artifacts-data:/app/artifacts:rw
-    environment:
-      - PYTORCH_ENABLE_MPS_FALLBACK=1
-      - PYTHONUNBUFFERED=1
-      - DATABASE_URL=postgresql://pytorch:pytorch_secret@postgres:5432/pytorchrunner
-      - REDIS_URL=redis://redis:6379
-      - ARTIFACT_BASE_PATH=/app/artifacts
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    command: ["python", "main.py"]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9100/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # Training API (Future implementation)
-  training-api:
-    build: .
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8000:8000"
-    labels:
-      # Enable Traefik
-      - "traefik.enable=true"
-      # Local HTTP router (.pow domain)
-      - "traefik.http.routers.pytorch-train-api.rule=Host(`pytorch-train.pow`)"
-      - "traefik.http.routers.pytorch-train-api.entrypoints=web"
-      - "traefik.http.services.pytorch-train-api.loadbalancer.server.port=8000"
-    networks:
-      - default
-      - traefik
-    volumes:
-      - ./src:/app/src:rw
-      - ./examples:/app/examples:rw
-      - training-api-cache:/app/src/__pycache__
-    environment:
-      - PYTORCH_ENABLE_MPS_FALLBACK=1
-      - PYTHONUNBUFFERED=1
-      - REDIS_URL=redis://redis:6379
-    command: ["python", "-m", "uvicorn", "src.server.api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-    depends_on:
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-  # Redis for training queue and job management
+  # Redis — optional queue / pub-sub (available for future use)
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     command: >
       redis-server
       --appendonly yes
-      --maxmemory 1gb
+      --maxmemory 512mb
       --maxmemory-policy volatile-lru
-      --save 60 1000
       --loglevel warning
     ports:
       - "127.0.0.1:6379:6379"
@@ -122,54 +42,43 @@ services:
       - redis-data:/data
     networks:
       - default
-    environment:
-      - REDIS_REPLICATION_MODE=master
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 10s
-    sysctls:
-      - net.core.somaxconn=65535
 
-  # Frontend (Astro + React)
+  # Frontend — Astro SSR app that serves UI + all /api/* routes
+  # Single URL for EVERYTHING: pytorch.pow
   frontend:
     build: ./frontend
     restart: unless-stopped
     ports:
-      - "127.0.0.1:4324:4321"
+      - "127.0.0.1:4321:4321"
     labels:
-      # Enable Traefik
       - "traefik.enable=true"
-      # Local HTTP router (.pow domain)
-      - "traefik.http.routers.pytorch-frontend.rule=Host(`pytorch.pow`)"
-      - "traefik.http.routers.pytorch-frontend.entrypoints=web"
-      - "traefik.http.services.pytorch-frontend.loadbalancer.server.port=4321"
+      - "traefik.http.routers.pytorch.rule=Host(`pytorch.pow`)"
+      - "traefik.http.routers.pytorch.entrypoints=web"
+      - "traefik.http.services.pytorch.loadbalancer.server.port=4321"
     networks:
       - default
       - traefik
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=production
       - HOST=0.0.0.0
       - PORT=4321
-      # API endpoints (internal Docker network)
-      - PUBLIC_SCRIPT_API_URL=http://script-api:9100
-      - PUBLIC_TRAINING_API_URL=http://training-api:8000
-      # External API endpoints (for browser requests via Traefik)
-      - PUBLIC_EXTERNAL_SCRIPT_API=http://pytorch-api.pow
-      - PUBLIC_EXTERNAL_TRAINING_API=http://pytorch-train.pow
+      - DATABASE_URL=postgresql://pytorch:pytorch_secret@postgres:5432/pytorchrunner
+      - REDIS_URL=redis://redis:6379
     volumes:
-      # Development hot-reloading
       - ./frontend/src:/app/src:rw
       - ./frontend/public:/app/public:rw
-      # Prevent node_modules override
       - /app/node_modules
     depends_on:
-      script-api:
+      postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4321/ || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4321/api/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -206,11 +115,5 @@ volumes:
     driver: local
   redis-insight-data:
     driver: local
-  script-api-cache:
-    driver: local
-  training-api-cache:
-    driver: local
   postgres-data:
-    driver: local
-  artifacts-data:
     driver: local
