@@ -1,0 +1,43 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { AnalyticsDashboard } from '../components/pytorch/AnalyticsDashboard';
+---
+
+<Layout title="Analytics">
+  <div class="py-10">
+    <header>
+      <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+        <div class="sm:flex sm:items-center sm:justify-between">
+          <div>
+            <h1 class="text-3xl font-bold leading-tight tracking-tight text-gray-900">
+              Analytics
+            </h1>
+            <p class="mt-2 text-sm text-gray-600">
+              Experiment performance trends, hyperparameter analysis, and leaderboard
+            </p>
+          </div>
+          <div class="mt-4 sm:mt-0 flex gap-3">
+            <a
+              href="/experiments"
+              class="inline-flex items-center rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-700 shadow-sm ring-1 ring-inset ring-gray-300 hover:bg-gray-50"
+            >
+              View Experiments
+            </a>
+            <a
+              href="/scripts/new"
+              class="inline-flex items-center rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500"
+            >
+              + New Run
+            </a>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <div class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <AnalyticsDashboard client:load />
+      </div>
+    </main>
+  </div>
+</Layout>

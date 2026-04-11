@@ -1,9 +1,9 @@
 /**
  * PyTorchRunner Experiment Dashboard
- * Real-time visualization of training metrics, live output, and job monitoring
+ * Real-time training metrics, live output, anomaly detection, and early-stopping recommendations.
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -17,68 +17,31 @@ import {
   Filler
 } from 'chart.js';
 
-// Register Chart.js components
-ChartJS.register(
-  CategoryScale,
-  LinearScale,
-  PointElement,
-  LineElement,
-  Title,
-  Tooltip,
-  Legend,
-  Filler
-);
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
 import { pytorchAPI } from '../../lib/pytorch/api-client';
-import type { PyTorchJob, PyTorchExperiment, SSEJobEvent, MetricsChartData } from '../../types/pytorch';
+import { ResourceMonitor } from './ResourceMonitor';
+import type { PyTorchJob, SSEJobEvent, MetricsChartData } from '../../types/pytorch';
 
-// Chart configuration
-const chartOptions = {
-  responsive: true,
-  maintainAspectRatio: false,
-  animation: false, // Disable for real-time updates
-  interaction: {
-    intersect: false,
-    mode: 'index' as const,
-  },
-  scales: {
-    x: {
-      title: {
-        display: true,
-        text: 'Step'
-      },
-      type: 'linear' as const
-    },
-    y: {
-      title: {
-        display: true,
-        text: 'Value'
-      },
-      beginAtZero: false
-    }
-  },
-  plugins: {
-    legend: {
-      position: 'top' as const,
-    },
-    tooltip: {
-      filter: (tooltipItem: any) => tooltipItem.datasetIndex !== undefined
-    }
-  }
-};
+// ── Types ─────────────────────────────────────────────────────────────────────
 
-interface ExperimentDashboardProps {
-  experimentId?: number;
-  jobId?: string;
-  autoRefresh?: boolean;
+interface AnomalyAlert {
+  id: string;
+  type: 'nan_loss' | 'loss_spike' | 'loss_plateau' | 'accuracy_drop' | 'early_stop';
+  message: string;
+  severity: 'warning' | 'critical';
+  timestamp: number;
 }
 
 interface MetricsData {
   loss: number[];
   accuracy?: number[];
   learningRate?: number[];
+  val_loss?: number[];
+  val_accuracy?: number[];
   timestamps: number[];
   steps: number[];
+  [key: string]: number[] | undefined;
 }
 
 interface OutputLine {
@@ -88,256 +51,262 @@ interface OutputLine {
   lineNo: number;
 }
 
-export function ExperimentDashboard({
-  experimentId,
-  jobId,
-  autoRefresh = true
-}: ExperimentDashboardProps) {
-  // State management
+interface ExperimentDashboardProps {
+  experimentId?: number;
+  jobId?: string;
+  autoRefresh?: boolean;
+}
+
+// ── Anomaly detection ─────────────────────────────────────────────────────────
+
+function detectAnomalies(metrics: MetricsData): Omit<AnomalyAlert, 'id'>[] {
+  const alerts: Omit<AnomalyAlert, 'id'>[] = [];
+  const now = Date.now();
+  const { loss = [], accuracy = [] } = metrics;
+
+  // NaN loss
+  if (loss.some(v => isNaN(v) || !isFinite(v))) {
+    alerts.push({ type: 'nan_loss', message: 'NaN or Inf detected in loss — training may have diverged.', severity: 'critical', timestamp: now });
+  }
+
+  // Loss spike: last value > 2× previous moving average (window=5)
+  if (loss.length >= 6) {
+    const window = loss.slice(-6, -1);
+    const avg = window.reduce((a, b) => a + b, 0) / window.length;
+    const last = loss[loss.length - 1];
+    if (last > avg * 2.5 && avg < 2) {
+      alerts.push({ type: 'loss_spike', message: `Loss spike detected: ${last.toFixed(4)} vs avg ${avg.toFixed(4)}.`, severity: 'warning', timestamp: now });
+    }
+  }
+
+  // Loss plateau: last 10 steps have < 0.1% relative improvement
+  if (loss.length >= 20) {
+    const window = loss.slice(-15);
+    const first = window[0], last = window[window.length - 1];
+    const relImprovement = Math.abs(first - last) / (Math.abs(first) + 1e-8);
+    if (relImprovement < 0.001) {
+      alerts.push({ type: 'loss_plateau', message: `Loss has plateaued (<0.1% change in last 15 steps). Consider early stopping.`, severity: 'warning', timestamp: now });
+    }
+  }
+
+  // Accuracy drop: last val_accuracy below best by > 5%
+  if (accuracy && accuracy.length >= 10) {
+    const best = Math.max(...accuracy);
+    const last = accuracy[accuracy.length - 1];
+    if (best > 0.5 && (best - last) > 0.05) {
+      alerts.push({ type: 'accuracy_drop', message: `Accuracy dropped ${((best - last) * 100).toFixed(1)}% from best (${(best * 100).toFixed(1)}%).`, severity: 'warning', timestamp: now });
+    }
+  }
+
+  return alerts;
+}
+
+function shouldRecommendEarlyStopping(metrics: MetricsData): { recommend: boolean; reason: string } {
+  const { loss = [], val_loss } = metrics;
+
+  if (loss.length < 20) return { recommend: false, reason: '' };
+
+  // Plateau check
+  const tail = loss.slice(-10);
+  const head = loss.slice(-20, -10);
+  if (tail.length && head.length) {
+    const tailAvg = tail.reduce((a, b) => a + b) / tail.length;
+    const headAvg = head.reduce((a, b) => a + b) / head.length;
+    if (headAvg > 0 && Math.abs(headAvg - tailAvg) / headAvg < 0.005) {
+      return { recommend: true, reason: 'Training loss has not improved in 10 steps (< 0.5% change).' };
+    }
+  }
+
+  // Val loss divergence: val_loss consistently increasing while train loss decreases
+  if (val_loss && val_loss.length >= 10) {
+    const recent = val_loss.slice(-5);
+    const prev = val_loss.slice(-10, -5);
+    const recentAvg = recent.reduce((a, b) => a + b) / recent.length;
+    const prevAvg = prev.reduce((a, b) => a + b) / prev.length;
+    if (recentAvg > prevAvg * 1.05) {
+      return { recommend: true, reason: 'Validation loss is increasing — possible overfitting. Consider stopping.' };
+    }
+  }
+
+  return { recommend: false, reason: '' };
+}
+
+// ── Chart options ─────────────────────────────────────────────────────────────
+
+const chartOptions = {
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: false as const,
+  interaction: { intersect: false, mode: 'index' as const },
+  scales: {
+    x: { title: { display: true, text: 'Step' }, type: 'linear' as const },
+    y: { title: { display: true, text: 'Value' }, beginAtZero: false },
+  },
+  plugins: {
+    legend: { position: 'top' as const },
+    tooltip: { filter: (item: any) => item.datasetIndex !== undefined },
+  },
+};
+
+const METRIC_COLORS: Record<string, { border: string; bg: string }> = {
+  loss:         { border: 'rgb(239, 68, 68)',   bg: 'rgba(239, 68, 68, 0.1)' },
+  accuracy:     { border: 'rgb(34, 197, 94)',   bg: 'rgba(34, 197, 94, 0.1)' },
+  learningRate: { border: 'rgb(168, 85, 247)',  bg: 'rgba(168, 85, 247, 0.1)' },
+  val_loss:     { border: 'rgb(245, 158, 11)',  bg: 'rgba(245, 158, 11, 0.1)' },
+  val_accuracy: { border: 'rgb(59, 130, 246)',  bg: 'rgba(59, 130, 246, 0.1)' },
+};
+
+function alertId() {
+  return Math.random().toString(36).slice(2, 9);
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }: ExperimentDashboardProps) {
   const [job, setJob] = useState<PyTorchJob | null>(null);
-  const [metricsData, setMetricsData] = useState<MetricsData>({
-    loss: [],
-    accuracy: [],
-    learningRate: [],
-    timestamps: [],
-    steps: []
-  });
+  const [metricsData, setMetricsData] = useState<MetricsData>({ loss: [], accuracy: [], learningRate: [], val_loss: [], val_accuracy: [], timestamps: [], steps: [] });
   const [outputLines, setOutputLines] = useState<OutputLine[]>([]);
   const [isConnected, setIsConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [selectedMetrics, setSelectedMetrics] = useState<Set<string>>(new Set(['loss']));
+  const [anomalyAlerts, setAnomalyAlerts] = useState<AnomalyAlert[]>([]);
+  const [earlyStop, setEarlyStop] = useState<{ recommend: boolean; reason: string }>({ recommend: false, reason: '' });
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [showResourceMonitor, setShowResourceMonitor] = useState(false);
 
-  // Refs for auto-scroll and SSE
   const outputRef = useRef<HTMLDivElement>(null);
   const sseRef = useRef<EventSource | null>(null);
-  const [autoScroll, setAutoScroll] = useState(true);
+  const seenAnomalyKeys = useRef<Set<string>>(new Set());
 
-  // Initialize data loading and SSE connection
+  // ── Load job + start SSE ───────────────────────────────────────────────────
+
   useEffect(() => {
     if (!jobId) return;
+    let mounted = true;
 
-    let isMounted = true;
-
-    const initializeDashboard = async () => {
+    (async () => {
       try {
-        setError(null);
-
-        // Load initial job data
-        const jobData = await pytorchAPI.getJobStatus(jobId);
-        if (isMounted) {
-          setJob(jobData);
-        }
-
-        // Start SSE connection for real-time updates
-        if (autoRefresh) {
-          startSSEConnection();
-        }
+        const data = await pytorchAPI.getJobStatus(jobId);
+        if (mounted) setJob(data);
+        if (autoRefresh) startSSE();
       } catch (err) {
-        if (isMounted) {
-          setError(err instanceof Error ? err.message : 'Failed to load job data');
-        }
+        if (mounted) setConnectionError(err instanceof Error ? err.message : 'Failed to load job');
       }
-    };
+    })();
 
-    initializeDashboard();
-
-    return () => {
-      isMounted = false;
-      stopSSEConnection();
-    };
+    return () => { mounted = false; stopSSE(); };
   }, [jobId, autoRefresh]);
 
-  // Start SSE connection for real-time updates
-  const startSSEConnection = () => {
+  const startSSE = useCallback(() => {
     if (!jobId || sseRef.current) return;
+    const es = pytorchAPI.createJobStream(jobId);
+    sseRef.current = es;
 
-    try {
-      console.log(`Starting SSE connection for job ${jobId}`);
-      const eventSource = pytorchAPI.createJobStream(jobId);
-      sseRef.current = eventSource;
+    es.onopen = () => { setIsConnected(true); setConnectionError(null); };
 
-      eventSource.onopen = () => {
-        console.log('SSE connection opened');
-        setIsConnected(true);
-        setError(null);
-      };
+    es.onmessage = (event) => {
+      const data = pytorchAPI.parseSSEEvent(event);
+      if (data) handleSSEEvent(data);
+    };
 
-      eventSource.onmessage = (event) => {
-        try {
-          const data = pytorchAPI.parseSSEEvent(event);
-          if (data) {
-            handleSSEEvent(data);
-          }
-        } catch (err) {
-          console.error('Failed to parse SSE event:', err);
-        }
-      };
-
-      eventSource.onerror = (err) => {
-        console.error('SSE connection error:', err);
-        setIsConnected(false);
-        setError('Connection lost. Attempting to reconnect...');
-
-        // Auto-reconnect after delay
-        setTimeout(() => {
-          if (sseRef.current?.readyState === EventSource.CLOSED) {
-            startSSEConnection();
-          }
-        }, 5000);
-      };
-
-    } catch (err) {
-      setError('Failed to establish real-time connection');
-      console.error('SSE connection failed:', err);
-    }
-  };
-
-  // Stop SSE connection
-  const stopSSEConnection = () => {
-    if (sseRef.current) {
-      console.log('Closing SSE connection');
-      sseRef.current.close();
-      sseRef.current = null;
+    es.onerror = () => {
       setIsConnected(false);
-    }
+      setConnectionError('Connection lost. Retrying…');
+      setTimeout(() => {
+        if (sseRef.current?.readyState === EventSource.CLOSED) {
+          sseRef.current = null;
+          startSSE();
+        }
+      }, 5000);
+    };
+  }, [jobId]);
+
+  const stopSSE = () => {
+    sseRef.current?.close();
+    sseRef.current = null;
+    setIsConnected(false);
   };
 
-  // Handle SSE events
+  // ── SSE event handler ──────────────────────────────────────────────────────
+
   const handleSSEEvent = (event: SSEJobEvent) => {
     switch (event.type) {
       case 'stdout':
       case 'stderr':
-        if (event.line && event.line_no !== undefined) {
-          const outputLine: OutputLine = {
-            timestamp: Date.now(),
-            line: event.line,
-            stream: event.type,
-            lineNo: event.line_no
-          };
-
-          setOutputLines(prev => {
-            const updated = [...prev, outputLine];
-            // Keep only last 500 lines to prevent memory issues
-            return updated.slice(-500);
-          });
-
-          // Auto-scroll to bottom
+        if (event.line !== undefined && event.line_no !== undefined) {
+          const line: OutputLine = { timestamp: Date.now(), line: event.line, stream: event.type, lineNo: event.line_no };
+          setOutputLines(prev => [...prev, line].slice(-500));
           if (autoScroll && outputRef.current) {
-            setTimeout(() => {
-              outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight, behavior: 'smooth' });
-            }, 50);
+            setTimeout(() => outputRef.current?.scrollTo({ top: outputRef.current.scrollHeight, behavior: 'smooth' }), 50);
           }
-
-          // Try to parse metrics from output
-          const parsedMetrics = parseMetricsFromLine(event.line);
-          if (parsedMetrics) {
-            updateMetricsData(parsedMetrics);
-          }
+          const parsed = parseMetricsFromLine(event.line);
+          if (parsed) applyMetricsUpdate(parsed);
         }
         break;
 
       case 'status':
-        if (job) {
-          setJob(prev => prev ? {
-            ...prev,
-            status: event.status || prev.status,
-            progress: event.progress !== undefined ? event.progress : prev.progress
-          } : prev);
-        }
+        setJob(prev => prev ? { ...prev, status: event.status || prev.status, progress: event.progress ?? prev.progress } : prev);
         break;
 
       case 'metrics':
-        if (event.metrics) {
-          updateMetricsData({
-            metrics: event.metrics,
-            step: event.step || metricsData.steps.length,
-            epoch: event.epoch
-          });
-        }
+        if (event.metrics) applyMetricsUpdate({ metrics: event.metrics, step: event.step, epoch: event.epoch });
         break;
 
       case 'done':
-        console.log('Job completed:', event);
         setIsConnected(false);
-        if (job) {
-          setJob(prev => prev ? {
-            ...prev,
-            status: event.status || 'completed',
-            progress: 1.0,
-            exitCode: event.exit_code || 0
-          } : prev);
-        }
-        stopSSEConnection();
+        setJob(prev => prev ? { ...prev, status: event.status || 'completed', progress: 1.0, exitCode: event.exit_code ?? 0 } : prev);
+        stopSSE();
         break;
     }
   };
 
-  // Parse metrics from output line
+  // ── Metrics parsing & updating ─────────────────────────────────────────────
+
   const parseMetricsFromLine = (line: string): { metrics: Record<string, number>; step?: number; epoch?: number } | null => {
-    // Pattern for "Epoch 5/10, Step 100, Loss: 0.234, Accuracy: 0.92"
-    const epochStepPattern = /Epoch (\d+)(?:\/\d+)?,?\s*Step (\d+),?\s*Loss:\s*([\d.]+)(?:,?\s*Acc(?:uracy)?:\s*([\d.]+))?/i;
-    const match = line.match(epochStepPattern);
-
-    if (match) {
-      const metrics: Record<string, number> = {
-        loss: parseFloat(match[3])
-      };
-
-      if (match[4]) {
-        metrics.accuracy = parseFloat(match[4]);
-      }
-
-      return {
-        metrics,
-        epoch: parseInt(match[1]),
-        step: parseInt(match[2])
-      };
+    const full = /Epoch (\d+)(?:\/\d+)?,?\s*Step (\d+),?\s*Loss:\s*([\d.]+)(?:,?\s*Acc(?:uracy)?:\s*([\d.]+))?/i.exec(line);
+    if (full) {
+      const m: Record<string, number> = { loss: parseFloat(full[3]) };
+      if (full[4]) m.accuracy = parseFloat(full[4]);
+      return { metrics: m, epoch: parseInt(full[1]), step: parseInt(full[2]) };
     }
 
-    // Simple loss pattern: "Loss: 0.234"
-    const lossPattern = /Loss:\s*([\d.]+)/i;
-    const lossMatch = line.match(lossPattern);
-    if (lossMatch) {
-      return {
-        metrics: { loss: parseFloat(lossMatch[1]) }
-      };
+    const lossOnly = /(?:^|\s)[Ll]oss[:\s=]+([\d.eE+\-]+)/.exec(line);
+    if (lossOnly) {
+      const m: Record<string, number> = { loss: parseFloat(lossOnly[1]) };
+      const acc = /[Aa]cc(?:uracy)?[:\s=]+([\d.]+)/.exec(line);
+      if (acc) m.accuracy = parseFloat(acc[1]);
+      const valLoss = /[Vv]al[_\s][Ll]oss[:\s=]+([\d.eE+\-]+)/.exec(line);
+      if (valLoss) m.val_loss = parseFloat(valLoss[1]);
+      const valAcc = /[Vv]al[_\s][Aa]cc[:\s=]+([\d.]+)/.exec(line);
+      if (valAcc) m.val_accuracy = parseFloat(valAcc[1]);
+      const lr = /[Ll][Rr][:\s=]+([\d.eE+\-]+)/.exec(line);
+      if (lr) m.learningRate = parseFloat(lr[1]);
+      return { metrics: m };
     }
 
     return null;
   };
 
-  // Update metrics data
-  const updateMetricsData = (update: { metrics: Record<string, number>; step?: number; epoch?: number }) => {
+  const applyMetricsUpdate = (update: { metrics: Record<string, number>; step?: number; epoch?: number }) => {
     setMetricsData(prev => {
-      const newStep = update.step !== undefined ? update.step : prev.steps.length;
-      const newTimestamp = Date.now();
+      const newStep = update.step ?? prev.steps.length;
+      const updated: MetricsData = { ...prev };
 
-      const updated = { ...prev };
-
-      // Add new step and timestamp
       updated.steps = [...prev.steps, newStep];
-      updated.timestamps = [...prev.timestamps, newTimestamp];
+      updated.timestamps = [...prev.timestamps, Date.now()];
 
-      // Add metric values
-      Object.entries(update.metrics).forEach(([key, value]) => {
-        if (typeof value === 'number') {
-          if (!updated[key as keyof MetricsData]) {
-            (updated as any)[key] = [];
-          }
-          (updated as any)[key].push(value);
+      Object.entries(update.metrics).forEach(([k, v]) => {
+        if (typeof v === 'number') {
+          const existing = (updated[k] as number[] | undefined) ?? [];
+          (updated as any)[k] = [...existing, v];
         }
       });
 
-      // Keep only last 1000 points for performance
-      const maxPoints = 1000;
-      if (updated.steps.length > maxPoints) {
-        updated.steps = updated.steps.slice(-maxPoints);
-        updated.timestamps = updated.timestamps.slice(-maxPoints);
-
-        Object.keys(updated).forEach(key => {
-          if (Array.isArray((updated as any)[key]) && key !== 'steps' && key !== 'timestamps') {
-            (updated as any)[key] = (updated as any)[key].slice(-maxPoints);
-          }
+      // Cap at 1000 points
+      if (updated.steps.length > 1000) {
+        const trim = (arr: number[]) => arr.slice(-1000);
+        Object.keys(updated).forEach(k => {
+          if (Array.isArray((updated as any)[k])) (updated as any)[k] = trim((updated as any)[k]);
         });
       }
 
@@ -345,181 +314,220 @@ export function ExperimentDashboard({
     });
   };
 
-  // Prepare chart data
+  // ── Anomaly detection effect (runs after each metrics update) ─────────────
+
+  useEffect(() => {
+    if (metricsData.loss.length < 5) return;
+
+    const newAnomalies = detectAnomalies(metricsData);
+    setAnomalyAlerts(prev => {
+      const updated = [...prev];
+      newAnomalies.forEach(a => {
+        const key = `${a.type}:${Math.floor(a.timestamp / 30000)}`; // dedupe per 30s window
+        if (!seenAnomalyKeys.current.has(key)) {
+          seenAnomalyKeys.current.add(key);
+          updated.push({ ...a, id: alertId() });
+        }
+      });
+      return updated.slice(-10);
+    });
+
+    const es = shouldRecommendEarlyStopping(metricsData);
+    setEarlyStop(es);
+  }, [metricsData.loss.length]);
+
+  // ── Chart data ─────────────────────────────────────────────────────────────
+
   const chartData: MetricsChartData = useMemo(() => {
-    const datasets = [];
+    const datasets: MetricsChartData['datasets'] = [];
+    const allMetricKeys = ['loss', 'accuracy', 'learningRate', 'val_loss', 'val_accuracy'];
 
-    if (selectedMetrics.has('loss') && metricsData.loss.length > 0) {
+    allMetricKeys.forEach(key => {
+      const data = metricsData[key] as number[] | undefined;
+      if (!selectedMetrics.has(key) || !data || data.length === 0) return;
+      const color = METRIC_COLORS[key] ?? { border: 'rgb(107,114,128)', bg: 'rgba(107,114,128,0.1)' };
       datasets.push({
-        label: 'Loss',
-        data: metricsData.steps.map((step, i) => ({ x: step, y: metricsData.loss[i] })),
-        borderColor: 'rgb(239, 68, 68)',
-        backgroundColor: 'rgba(239, 68, 68, 0.1)',
-        tension: 0.1
+        label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        data: metricsData.steps.map((step, i) => ({ x: step, y: data[i] })),
+        borderColor: color.border,
+        backgroundColor: color.bg,
+        tension: 0.3,
       });
-    }
-
-    if (selectedMetrics.has('accuracy') && metricsData.accuracy && metricsData.accuracy.length > 0) {
-      datasets.push({
-        label: 'Accuracy',
-        data: metricsData.steps.map((step, i) => ({ x: step, y: metricsData.accuracy![i] })),
-        borderColor: 'rgb(34, 197, 94)',
-        backgroundColor: 'rgba(34, 197, 94, 0.1)',
-        tension: 0.1
-      });
-    }
-
-    if (selectedMetrics.has('learningRate') && metricsData.learningRate && metricsData.learningRate.length > 0) {
-      datasets.push({
-        label: 'Learning Rate',
-        data: metricsData.steps.map((step, i) => ({ x: step, y: metricsData.learningRate![i] })),
-        borderColor: 'rgb(168, 85, 247)',
-        backgroundColor: 'rgba(168, 85, 247, 0.1)',
-        tension: 0.1
-      });
-    }
+    });
 
     return { datasets };
   }, [metricsData, selectedMetrics]);
 
-  // Get status color
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'completed': return 'text-green-600 bg-green-100';
-      case 'running': return 'text-blue-600 bg-blue-100';
-      case 'failed': return 'text-red-600 bg-red-100';
-      case 'cancelled': return 'text-gray-600 bg-gray-100';
-      default: return 'text-yellow-600 bg-yellow-100';
-    }
-  };
-
-  // Handle metric selection toggle
-  const toggleMetric = (metric: string) => {
+  const toggleMetric = (m: string) => {
     setSelectedMetrics(prev => {
-      const updated = new Set(prev);
-      if (updated.has(metric)) {
-        updated.delete(metric);
-      } else {
-        updated.add(metric);
-      }
-      return updated;
+      const s = new Set(prev);
+      s.has(m) ? s.delete(m) : s.add(m);
+      return s;
     });
   };
 
-  // Cancel job
   const handleCancelJob = async () => {
     if (!jobId) return;
-
     try {
       await pytorchAPI.cancelJob(jobId);
-      if (job) {
-        setJob({ ...job, status: 'cancelled' });
-      }
+      setJob(prev => prev ? { ...prev, status: 'cancelled' } : prev);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to cancel job');
+      setConnectionError(err instanceof Error ? err.message : 'Failed to cancel job');
     }
   };
 
+  const dismissAnomaly = (id: string) => setAnomalyAlerts(prev => prev.filter(a => a.id !== id));
+
+  const getStatusColor = (status: string) => {
+    const map: Record<string, string> = {
+      completed: 'text-green-600 bg-green-100',
+      running: 'text-blue-600 bg-blue-100',
+      failed: 'text-red-600 bg-red-100',
+      cancelled: 'text-gray-600 bg-gray-100',
+    };
+    return map[status] ?? 'text-yellow-600 bg-yellow-100';
+  };
+
+  const allMetricKeys = ['loss', 'accuracy', 'learningRate', 'val_loss', 'val_accuracy'];
+
   if (!jobId) {
-    return (
-      <div className="text-center py-8">
-        <p className="text-gray-500">No job selected for monitoring</p>
-      </div>
-    );
+    return <div className="text-center py-8 text-gray-500">No job selected for monitoring.</div>;
   }
 
   return (
     <div className="space-y-6">
-      {/* Error banner — shown even before job data loads */}
-      {error && !job && (
+      {/* Error banner */}
+      {connectionError && !job && (
         <div className="bg-red-50 border border-red-200 rounded-md p-4">
-          <p className="text-sm text-red-800">{error}</p>
+          <p className="text-sm text-red-800">{connectionError}</p>
         </div>
       )}
 
-      {/* Job Status Header */}
+      {/* Early-stopping recommendation */}
+      {earlyStop.recommend && (
+        <div className="bg-amber-50 border border-amber-300 rounded-lg p-4 flex items-start gap-3">
+          <span className="text-xl">🛑</span>
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-amber-800">Early Stopping Recommended</p>
+            <p className="text-sm text-amber-700 mt-0.5">{earlyStop.reason}</p>
+          </div>
+          {job?.status === 'running' && (
+            <button onClick={handleCancelJob} className="flex-shrink-0 inline-flex items-center px-3 py-1.5 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700">
+              Stop Job
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Anomaly alerts */}
+      {anomalyAlerts.length > 0 && (
+        <div className="space-y-2">
+          {anomalyAlerts.map(alert => (
+            <div key={alert.id} className={`flex items-start justify-between gap-2 border rounded-md px-4 py-2 text-sm ${
+              alert.severity === 'critical' ? 'bg-red-50 border-red-300 text-red-800' : 'bg-yellow-50 border-yellow-300 text-yellow-800'
+            }`}>
+              <div className="flex items-start gap-2">
+                <span>{alert.severity === 'critical' ? '🔴' : '⚠️'}</span>
+                <span>{alert.message}</span>
+              </div>
+              <button onClick={() => dismissAnomaly(alert.id)} className="flex-shrink-0 opacity-50 hover:opacity-100">
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Job status header */}
       {job && (
         <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6">
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="text-lg font-semibold text-gray-900">Job {job.jobId}</h2>
-              <p className="text-sm text-gray-500">Experiment {experimentId || 'Unknown'}</p>
+              <p className="text-sm text-gray-500">Experiment {experimentId ?? 'Unknown'}</p>
             </div>
             <div className="flex items-center space-x-3">
               <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(job.status)}`}>
                 {job.status}
               </span>
-              <div className={`h-3 w-3 rounded-full ${isConnected ? 'bg-green-400' : 'bg-red-400'}`}
-                   title={isConnected ? 'Connected' : 'Disconnected'} />
+              <div className={`h-3 w-3 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}
+                   title={isConnected ? 'Live' : 'Disconnected'} />
             </div>
           </div>
 
-          {/* Progress Bar */}
           {job.status === 'running' && (
             <div className="mb-4">
-              <div className="flex items-center justify-between text-sm">
+              <div className="flex items-center justify-between text-sm mb-1">
                 <span className="text-gray-600">Progress</span>
-                <span className="text-gray-900">{Math.round(job.progress * 100)}%</span>
+                <span className="text-gray-900 font-medium">{Math.round(job.progress * 100)}%</span>
               </div>
-              <div className="mt-1 bg-gray-200 rounded-full h-2">
-                <div
-                  className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                  style={{ width: `${job.progress * 100}%` }}
-                />
+              <div className="bg-gray-200 rounded-full h-2">
+                <div className="bg-blue-600 h-2 rounded-full transition-all duration-300" style={{ width: `${job.progress * 100}%` }} />
               </div>
             </div>
           )}
 
-          {/* Job Actions */}
-          <div className="flex items-center justify-between">
-            <div className="flex space-x-4 text-sm text-gray-600">
-              <span>Started: {job.startedAt ? pytorchAPI.formatTimestamp(job.startedAt) : 'Not started'}</span>
-              {job.completedAt && (
-                <span>Completed: {pytorchAPI.formatTimestamp(job.completedAt)}</span>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex flex-wrap gap-4 text-sm text-gray-600">
+              <span>Started: {job.startedAt ? pytorchAPI.formatTimestamp(job.startedAt) : '—'}</span>
+              {job.completedAt > 0 && <span>Completed: {pytorchAPI.formatTimestamp(job.completedAt)}</span>}
+              {job.startedAt > 0 && <span>Duration: {pytorchAPI.calculateDuration(job.startedAt, job.completedAt || Date.now())}</span>}
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setShowResourceMonitor(s => !s)}
+                className="inline-flex items-center px-3 py-1.5 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+              >
+                {showResourceMonitor ? 'Hide' : 'Show'} System
+              </button>
+              {job.status === 'running' && (
+                <button onClick={handleCancelJob} className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded-md text-red-700 bg-white hover:bg-red-50">
+                  Cancel Job
+                </button>
               )}
             </div>
-            {job.status === 'running' && (
-              <button
-                onClick={handleCancelJob}
-                className="inline-flex items-center px-3 py-1.5 border border-red-300 text-sm font-medium rounded-md text-red-700 bg-white hover:bg-red-50"
-              >
-                Cancel Job
-              </button>
-            )}
           </div>
 
-          {error && (
+          {connectionError && (
             <div className="mt-4 bg-red-50 border border-red-200 rounded-md p-3">
-              <p className="text-sm text-red-800">{error}</p>
+              <p className="text-sm text-red-800">{connectionError}</p>
             </div>
           )}
         </div>
       )}
 
-      {/* Metrics Visualization */}
+      {/* Resource monitor (toggleable) */}
+      {showResourceMonitor && <ResourceMonitor />}
+
+      {/* Training metrics chart */}
       <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <h3 className="text-lg font-medium text-gray-900">Training Metrics</h3>
 
-          {/* Metric Selection */}
-          <div className="flex space-x-2">
-            {(['loss', 'accuracy', 'learningRate'] as const).map(metric => {
-              const hasData = metricsData[metric] && metricsData[metric]!.length > 0;
+          <div className="flex flex-wrap gap-2">
+            {allMetricKeys.map(key => {
+              const data = metricsData[key] as number[] | undefined;
+              const hasData = data && data.length > 0;
+              const color = METRIC_COLORS[key] ?? { border: 'rgb(107,114,128)', bg: '' };
               return (
                 <button
-                  key={metric}
-                  onClick={() => toggleMetric(metric)}
+                  key={key}
+                  onClick={() => hasData && toggleMetric(key)}
                   disabled={!hasData}
-                  className={`px-3 py-1 rounded-md text-sm font-medium transition-colors ${
-                    selectedMetrics.has(metric)
-                      ? 'bg-blue-100 text-blue-800'
+                  title={hasData ? undefined : 'No data yet'}
+                  className={`px-3 py-1 rounded-md text-xs font-medium transition-colors border ${
+                    selectedMetrics.has(key) && hasData
+                      ? 'text-white border-transparent'
                       : hasData
-                      ? 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                      : 'bg-gray-50 text-gray-400 cursor-not-allowed'
+                      ? 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
+                      : 'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed'
                   }`}
+                  style={selectedMetrics.has(key) && hasData ? { backgroundColor: color.border, borderColor: color.border } : {}}
                 >
-                  {metric.charAt(0).toUpperCase() + metric.slice(1)}
-                  {hasData && ` (${metricsData[metric]!.length})`}
+                  {key.replace(/_/g, ' ')}
+                  {hasData && ` (${data!.length})`}
                 </button>
               );
             })}
@@ -531,53 +539,47 @@ export function ExperimentDashboard({
             <Line data={chartData} options={chartOptions} />
           </div>
         ) : (
-          <div className="flex items-center justify-center h-80 text-gray-500">
+          <div className="flex items-center justify-center h-80 text-gray-400">
             <div className="text-center">
-              <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              <svg className="mx-auto h-12 w-12 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
               </svg>
-              <p>No metrics data available</p>
-              <p className="text-sm">Metrics will appear here as the job runs</p>
+              <p className="mt-2 text-sm">No metrics yet — waiting for job output…</p>
             </div>
           </div>
         )}
       </div>
 
-      {/* Live Output */}
+      {/* Live output terminal */}
       <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-medium text-gray-900">Live Output</h3>
-          <div className="flex items-center space-x-2">
-            <label className="flex items-center">
+          <div className="flex items-center space-x-3">
+            <label className="flex items-center text-sm text-gray-600 cursor-pointer select-none">
               <input
                 type="checkbox"
                 checked={autoScroll}
-                onChange={(e) => setAutoScroll(e.target.checked)}
-                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                onChange={e => setAutoScroll(e.target.checked)}
+                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 mr-2"
               />
-              <span className="ml-2 text-sm text-gray-600">Auto-scroll</span>
+              Auto-scroll
             </label>
-            <span className="text-sm text-gray-500">
-              {outputLines.length} lines
-            </span>
+            <span className="text-sm text-gray-500">{outputLines.length} lines</span>
           </div>
         </div>
 
         <div
           ref={outputRef}
-          className="bg-gray-900 text-gray-100 p-4 rounded-lg font-mono text-sm h-80 overflow-y-auto"
+          className="bg-gray-900 text-gray-100 p-4 rounded-lg font-mono text-xs h-80 overflow-y-auto leading-5"
         >
           {outputLines.length === 0 ? (
             <div className="flex items-center justify-center h-full text-gray-500">
-              <p>Output will appear here when the job starts...</p>
+              Output will appear here when the job starts…
             </div>
           ) : (
-            outputLines.map((line, index) => (
-              <div
-                key={`${line.lineNo}-${index}`}
-                className={`${line.stream === 'stderr' ? 'text-red-400' : 'text-gray-100'}`}
-              >
-                <span className="text-gray-500 mr-2">{String(line.lineNo + 1).padStart(4, ' ')}</span>
+            outputLines.map((line, idx) => (
+              <div key={`${line.lineNo}-${idx}`} className={line.stream === 'stderr' ? 'text-red-400' : ''}>
+                <span className="select-none text-gray-600 mr-3">{String(line.lineNo + 1).padStart(5, ' ')}</span>
                 {line.line}
               </div>
             ))

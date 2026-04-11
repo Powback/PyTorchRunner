@@ -1,0 +1,93 @@
+---
+export interface Props {
+	title: string;
+	description?: string;
+}
+
+const { title, description = "PyTorchRunner - MPS Training Service" } = Astro.props;
+const path = Astro.url.pathname;
+
+const navLinks = [
+  { href: '/',            label: 'Dashboard',    exact: true  },
+  { href: '/experiments', label: 'Experiments',  exact: false },
+  { href: '/jobs',        label: 'Jobs',         exact: false },
+  { href: '/scripts',     label: 'Scripts',      exact: false },
+  { href: '/analytics',   label: 'Analytics',    exact: false },
+];
+---
+
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-gray-50">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="description" content={description} />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<title>{title} | PyTorchRunner</title>
+		<script type="importmap">
+		{
+			"imports": {
+				"chart.js": "/node_modules/chart.js/dist/chart.js",
+				"react-chartjs-2": "/node_modules/react-chartjs-2/dist/index.js"
+			}
+		}
+		</script>
+	</head>
+	<body class="h-full">
+		<div class="min-h-full">
+			<!-- Navigation -->
+			<nav class="bg-white shadow-sm border-b border-gray-200">
+				<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+					<div class="flex justify-between h-16">
+						<div class="flex">
+							<div class="flex-shrink-0 flex items-center">
+								<span class="text-xl font-bold text-gray-900">PyTorchRunner</span>
+							</div>
+							<div class="hidden sm:ml-6 sm:flex sm:space-x-8">
+								{navLinks.map(link => {
+									const active = link.exact ? path === link.href : path.startsWith(link.href);
+									return (
+										<a
+											href={link.href}
+											class={`inline-flex items-center px-1 pt-1 border-b-2 text-sm font-medium transition-colors ${
+												active
+													? 'border-indigo-500 text-gray-900'
+													: 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+											}`}
+										>
+											{link.label}
+										</a>
+									);
+								})}
+							</div>
+						</div>
+						<div class="flex items-center">
+							<div class="flex-shrink-0">
+								<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
+									MPS Available
+								</span>
+							</div>
+						</div>
+					</div>
+				</div>
+			</nav>
+
+			<!-- Main content -->
+			<main class="flex-1">
+				<slot />
+			</main>
+		</div>
+
+		<!-- Global styles -->
+		<style>
+			html {
+				font-family: system-ui, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol';
+			}
+		</style>
+
+		<!-- Import global CSS -->
+		<style is:global>
+			@import '../styles/global.css';
+		</style>
+	</body>
+</html>

@@ -10,6 +10,7 @@ redis[async]>=5.0.0
 
 # Persistent job store
 aiosqlite>=0.19.0
+asyncpg>=0.29.0
 
 # PyTorch and ML
 torch>=2.1.0

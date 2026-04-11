@@ -1,6 +1,7 @@
 """
-Script Execution API for PyTorchRunner  — v3.0.0
-Persistent job history, namespace support, and safe multi-agent cancellation.
+Script Execution API for PyTorchRunner  — v3.1.0
+Persistent job history, namespace support, safe multi-agent cancellation,
+and comprehensive storage: PostgreSQL experiments, Redis metrics, artifact files.
 """
 import asyncio
 import json
@@ -18,6 +19,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .job_store import JobStore
+from ..storage.database import Database
+from ..storage.experiment_store import ExperimentStore
+from ..storage.metrics_store import MetricsStore
+from ..storage.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,8 +41,14 @@ PREVIEW_MAX_BYTES = 2000
 # Max bytes to keep in full output buffers (1 MB per stream)
 FULL_MAX_BYTES = 1_000_000
 
-# Persistent store
+# Persistent store (SQLite — lightweight, always available)
 job_store = JobStore()
+
+# Advanced storage layer (PostgreSQL + Redis + filesystem)
+_db = Database()
+_experiment_store = ExperimentStore(_db)
+_metrics_store = MetricsStore()
+_artifact_store = ArtifactStore(_db)
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -51,6 +62,7 @@ class ScriptExecutionRequest(BaseModel):
     env_vars: Dict[str, str] = {}
     job_name: Optional[str] = None
     namespace: str = "default"
+    tags: List[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +89,23 @@ app.add_middleware(
 @app.on_event("startup")
 async def _startup():
     await job_store.initialize()
-    logger.info("PyTorchRunner Script Executor ready (persistent store: %s)", job_store.db_path)
+    # Advanced storage (gracefully degrades if unavailable)
+    await _db.connect()
+    await _metrics_store.connect()
+    await _artifact_store.initialize()
+    logger.info(
+        "PyTorchRunner Script Executor ready (sqlite=%s, postgres=%s, redis=%s)",
+        job_store.db_path,
+        "connected" if _db.is_connected else "unavailable",
+        "connected" if _metrics_store.is_connected else "unavailable",
+    )
 
 
 @app.on_event("shutdown")
 async def _shutdown():
     await job_store.close()
+    await _db.disconnect()
+    await _metrics_store.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +148,7 @@ async def run_script(request: ScriptExecutionRequest, background_tasks: Backgrou
         "cwd": request.cwd,
         "env_vars": request.env_vars,
         "job_name": request.job_name or f"script-{job_id[:8]}",
+        "tags": request.tags,
         "status": "queued",
         "progress": 0.0,
         "created_at": now,
@@ -146,8 +170,10 @@ async def run_script(request: ScriptExecutionRequest, background_tasks: Backgrou
 
     jobs_db[job_id] = job_data
 
-    # Persist metadata immediately so it survives a restart
+    # Persist to SQLite (always available)
     await job_store.save_job(job_data)
+    # Persist to PostgreSQL (gracefully no-ops if unavailable)
+    await _experiment_store.create(job_data)
 
     asyncio.create_task(execute_script(job_id))
 
@@ -489,7 +515,9 @@ async def _read_stream(
     job_data: dict,
     field_prefix: str,
 ):
-    """Read lines from an async stream, updating job_data incrementally."""
+    """Read lines from an async stream, updating job_data incrementally.
+    Also buffers output to Redis Streams for replay (fire-and-forget)."""
+    job_id = job_data["job_id"]
     while True:
         try:
             line_bytes = await stream.readline()
@@ -511,6 +539,12 @@ async def _read_stream(
         job_data[preview_key] = new_full[-PREVIEW_MAX_BYTES:]
         job_data[f"{field_prefix}_line_count"] = len(lines_list)
         job_data["updated_at"] = datetime.utcnow().isoformat()
+
+        # Buffer to Redis Streams for output replay
+        if field_prefix == "stdout":
+            asyncio.create_task(_metrics_store.append_stdout(job_id, line))
+        else:
+            asyncio.create_task(_metrics_store.append_stderr(job_id, line))
 
 
 async def execute_script(job_id: str):
@@ -574,7 +608,7 @@ async def execute_script(job_id: str):
         if exit_code != 0 and job_data.get("stderr_full"):
             job_data["error"] = job_data["stderr_full"][-500:]
 
-        # Persist final state including previews
+        # Persist final state including previews (SQLite)
         await job_store.update_job(
             job_id,
             {
@@ -588,6 +622,30 @@ async def execute_script(job_id: str):
                 "error": job_data.get("error"),
             },
         )
+
+        # PostgreSQL: update status
+        await _experiment_store.update_status(
+            job_id, final_status, job_data["progress"],
+            exit_code=exit_code, error=job_data.get("error"),
+        )
+
+        # Persist full stdout/stderr as artifact files
+        stdout_path = await _artifact_store.save_log(
+            job_id, "stdout", job_data.get("stdout_full", "")
+        )
+        stderr_path = await _artifact_store.save_log(
+            job_id, "stderr", job_data.get("stderr_full", "")
+        )
+        await _experiment_store.update_output_preview(
+            job_id,
+            stdout_preview=job_data.get("stdout_preview", ""),
+            stderr_preview=job_data.get("stderr_preview", ""),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+
+        # Set TTL on Redis output streams (auto-cleanup after 24h)
+        await _metrics_store.set_experiment_ttl(job_id)
 
         logger.info(
             "Job %s %s (exit=%s, stdout=%d lines, stderr=%d lines)",
@@ -615,6 +673,221 @@ async def execute_script(job_id: str):
                 "updated_at": now,
             },
         )
+        await _experiment_store.update_status(
+            job_id, "failed", 0.0, exit_code=-1, error=str(exc)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Experiment management endpoints (PostgreSQL-backed, with filtering/search)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/experiments", summary="List experiments with full-text search and tag filtering")
+async def list_experiments(
+    status: Optional[str] = Query(None, description="Filter by status"),
+    tags: Optional[str] = Query(None, description="Comma-separated tag filter (AND logic)"),
+    search: Optional[str] = Query(None, description="Full-text search (name, script, tags)"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """
+    List experiments from PostgreSQL with advanced filtering.
+
+    - **tags**: ``?tags=pytorch,gpt`` — returns only experiments with ALL listed tags
+    - **search**: ``?search=lstm training`` — full-text search across name/script/tags
+    - Falls back to empty list gracefully when PostgreSQL is unavailable.
+    """
+    tag_list = [t.strip() for t in tags.split(",")] if tags else None
+    experiments = await _experiment_store.list(
+        status=status, tags=tag_list, search=search, limit=limit, offset=offset
+    )
+    return [e.model_dump() for e in experiments]
+
+
+@app.get("/experiments/{experiment_id}", summary="Get full experiment record")
+async def get_experiment(experiment_id: str):
+    """Get full experiment details from PostgreSQL. Falls back to SQLite/memory."""
+    exp = await _experiment_store.get(experiment_id)
+    if exp:
+        return exp.model_dump()
+    # Fall back to SQLite
+    db_job = await job_store.get_job(experiment_id)
+    if db_job:
+        return db_job
+    if experiment_id in jobs_db:
+        return {k: v for k, v in jobs_db[experiment_id].items() if not k.startswith("_")}
+    raise HTTPException(status_code=404, detail="Experiment not found")
+
+
+@app.get("/experiments/{experiment_id}/metrics", summary="Get historical metrics from PostgreSQL")
+async def get_experiment_metrics(
+    experiment_id: str,
+    metric_name: Optional[str] = Query(None, description="Filter to a single metric name"),
+    limit: int = Query(1000, ge=1, le=10000),
+):
+    """
+    Retrieve persisted metric observations for an experiment.
+    Returns ``{metric_name: [{value, step, recorded_at}]}``.
+    """
+    return await _experiment_store.get_metrics(experiment_id, name=metric_name, limit=limit)
+
+
+@app.post("/experiments/{experiment_id}/metrics", summary="Record metrics for an experiment")
+async def record_experiment_metrics(
+    experiment_id: str,
+    metrics: Dict[str, float],
+    step: Optional[int] = Query(None),
+):
+    """
+    Manually record metric values for an experiment.
+    Writes to both PostgreSQL (persistent) and Redis Streams (real-time).
+    """
+    await _experiment_store.record_metrics_batch(experiment_id, metrics, step=step)
+    await _metrics_store.record_metrics_dict(experiment_id, metrics, step=step)
+    return {"recorded": list(metrics.keys()), "step": step}
+
+
+@app.get(
+    "/experiments/{experiment_id}/metrics/stream",
+    summary="Poll real-time metrics from Redis Streams",
+)
+async def get_metrics_realtime(
+    experiment_id: str,
+    since_id: str = Query("0", description="Redis stream ID cursor (0 = all)"),
+    count: int = Query(500, ge=1, le=5000),
+):
+    """
+    Read real-time metrics from Redis Streams. Supports efficient polling:
+
+    1. Call with ``since_id=0`` to get all data
+    2. Save the last ``id`` from the response
+    3. Poll with ``since_id=<last_id>`` to get only new entries
+    """
+    return await _metrics_store.get_metrics_stream(
+        experiment_id, since_id=since_id, count=count
+    )
+
+
+@app.get("/experiments/{experiment_id}/output/stream", summary="Replay output from Redis Streams")
+async def get_output_realtime(
+    experiment_id: str,
+    stream_type: str = Query("stdout", description="stdout or stderr"),
+    since_id: str = Query("0"),
+    count: int = Query(500, ge=1, le=5000),
+):
+    """
+    Replay output lines from Redis Streams. Useful for reconnecting after
+    SSE disconnect — survives the raw /stream endpoint's in-memory limitation.
+    """
+    if stream_type not in ("stdout", "stderr"):
+        raise HTTPException(status_code=400, detail="stream_type must be stdout or stderr")
+    return await _metrics_store.get_output_stream(
+        experiment_id, stream_type=stream_type, since_id=since_id, count=count
+    )
+
+
+@app.get("/experiments/{experiment_id}/artifacts", summary="List artifacts for an experiment")
+async def get_experiment_artifacts(experiment_id: str):
+    """List all registered artifacts (logs, checkpoints, outputs) for an experiment."""
+    return await _artifact_store.get_artifacts(experiment_id)
+
+
+@app.get("/experiments/{experiment_id}/checkpoints", summary="List model checkpoints")
+async def get_experiment_checkpoints(experiment_id: str):
+    """List model checkpoints registered for an experiment, ordered by epoch."""
+    return await _experiment_store.get_checkpoints(experiment_id)
+
+
+@app.post("/experiments/{experiment_id}/checkpoints", summary="Register a model checkpoint")
+async def register_checkpoint(
+    experiment_id: str,
+    epoch: int = Query(...),
+    file_path: str = Query(..., description="Absolute path to checkpoint file"),
+    step: Optional[int] = Query(None),
+    metrics: Optional[str] = Query(None, description="JSON-encoded metrics dict"),
+):
+    """Register a model checkpoint file for an experiment."""
+    metrics_dict: Dict[str, float] = {}
+    if metrics:
+        try:
+            metrics_dict = json.loads(metrics)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="metrics must be valid JSON")
+
+    stored_path = await _artifact_store.register_checkpoint(
+        experiment_id, epoch=epoch, source_path=file_path,
+        step=step, metrics=metrics_dict, copy=False,
+    )
+    return {"experiment_id": experiment_id, "epoch": epoch, "file_path": stored_path}
+
+
+@app.post("/experiments/{experiment_id}/tags", summary="Add tags to an experiment")
+async def add_experiment_tags(experiment_id: str, tags: List[str]):
+    """Add one or more tags to an experiment (deduplicates)."""
+    await _experiment_store.add_tags(experiment_id, tags)
+    return {"experiment_id": experiment_id, "tags_added": tags}
+
+
+@app.delete("/experiments/{experiment_id}", summary="Delete an experiment and its data")
+async def delete_experiment(experiment_id: str):
+    """
+    Delete an experiment, all artifacts, and Redis streams.
+    SQLite and in-memory records are also cleaned up.
+    """
+    await _experiment_store.delete(experiment_id)
+    await _artifact_store.delete_experiment_artifacts(experiment_id)
+    await _metrics_store.delete_experiment_streams(experiment_id)
+    jobs_db.pop(experiment_id, None)
+    return {"deleted": experiment_id}
+
+
+# ---------------------------------------------------------------------------
+# Storage health and maintenance
+# ---------------------------------------------------------------------------
+
+
+@app.get("/storage/health", summary="Storage subsystem health and statistics")
+async def storage_health():
+    """
+    Returns health and capacity stats for all storage backends:
+    PostgreSQL, Redis Streams, and the artifact filesystem.
+    """
+    stats = await _artifact_store.get_storage_stats()
+    experiment_count = await _experiment_store.count()
+    return {
+        "postgres_connected": _db.is_connected,
+        "redis_connected": _metrics_store.is_connected,
+        "sqlite_path": job_store.db_path,
+        "artifact_store_path": stats.get("base_path"),
+        "artifact_store_writable": stats.get("writable", False),
+        "artifact_store_mb": stats.get("total_mb", 0),
+        "artifact_count": stats.get("artifact_count", 0),
+        "total_experiments_postgres": experiment_count,
+        "total_jobs_memory": len(jobs_db),
+    }
+
+
+@app.post("/storage/cleanup", summary="Run storage cleanup policies")
+async def run_storage_cleanup(
+    max_experiment_age_days: int = Query(90, description="Delete experiments older than N days"),
+    max_artifact_age_days: int = Query(30, description="Delete artifacts older than N days"),
+):
+    """
+    Run cleanup: delete old experiments (keeping completed/failed) and stale artifacts.
+    Suitable for scheduling via cron or periodic task.
+    """
+    exp_deleted = await _experiment_store.cleanup_old(
+        max_age_days=max_experiment_age_days,
+        keep_statuses=["completed", "failed"],
+    )
+    art_deleted = await _artifact_store.cleanup_old_artifacts(
+        max_age_days=max_artifact_age_days,
+    )
+    return {
+        "experiments_deleted": exp_deleted,
+        "artifacts_deleted": art_deleted,
+    }
 
 
 if __name__ == "__main__":
