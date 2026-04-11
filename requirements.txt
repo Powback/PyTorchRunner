@@ -1,0 +1,24 @@
+# PyTorchRunner Dependencies
+
+# Core server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Queue system
+redis[async]>=5.0.0
+
+# Persistent job store
+aiosqlite>=0.19.0
+
+# PyTorch and ML
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+
+# HTTP client
+aiohttp>=3.9.0
+
+# Utilities
+python-multipart>=0.0.6
+python-json-logger>=2.0.0
