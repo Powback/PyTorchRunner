@@ -1,0 +1,4 @@
+# MLX Runner Requirements
+aiohttp>=3.9.0
+mlx>=0.0.1  # Apple MLX framework
+tensorboard>=2.14.0  # TensorBoard EventAccumulator for reading event files

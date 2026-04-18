@@ -1,6 +1,8 @@
 ---
 import Layout from '../../../layouts/Layout.astro';
 import ExperimentDashboard from '../../../components/pytorch/ExperimentDashboard.tsx';
+import { MetricsChart } from '../../../components/pytorch/MetricsChart.tsx';
+import { HyperparameterDisplay } from '../../../components/pytorch/HyperparameterDisplay.tsx';
 
 // Enable server-side rendering for dynamic routes
 export const prerender = false;
@@ -77,8 +79,17 @@ const { id } = Astro.params;
     </header>
 
     <main>
-      <div class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+      <div class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8 space-y-8">
         <ExperimentDashboard client:only="react" jobId={id} autoRefresh={true} />
+
+        <!-- TensorBoard-style scalar metrics from PostgreSQL -->
+        <div class="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6">
+          <h3 class="text-lg font-medium text-gray-900 mb-4">Scalar Metrics (TensorBoard)</h3>
+          <MetricsChart client:only="react" jobId={id} pollMs={5000} />
+        </div>
+
+        <!-- Hyperparameters / CLI args -->
+        <HyperparameterDisplay client:only="react" jobId={id} />
       </div>
     </main>
   </div>

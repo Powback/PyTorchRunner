@@ -32,6 +32,7 @@ logger = logging.getLogger('mlx_runner')
 POLL_INTERVAL = 2          # seconds between job polls
 OUTPUT_FLUSH_LINES = 5     # stream output every N lines
 METRICS_BATCH_SIZE = 10    # batch metrics before posting
+TB_SCAN_DIRS = ['runs', 'logs', 'tensorboard', 'tb_logs']  # dirs to scan for TensorBoard events
 
 
 class MLXRunner:
@@ -202,6 +203,9 @@ class MLXRunner:
             cmd = [sys.executable, script] + list(args)
             env = os.environ.copy()
             env.update({'PYTORCH_ENABLE_MPS_FALLBACK': '1', 'PYTHONUNBUFFERED': '1'})
+            # Expose job ID so training scripts can write TensorBoard events to the right dir
+            env['JOB_ID'] = job_id
+            env['PYTORCHRUNNER_JOB_ID'] = job_id
             env.update({k: str(v) for k, v in env_vars.items()})
 
             start = time.time()
@@ -220,6 +224,9 @@ class MLXRunner:
             # Flush any remaining metrics
             if metrics_buf:
                 await self._post_metrics(job_id, metrics_buf)
+
+            # Read TensorBoard event files after the job finishes
+            await self._read_tensorboard_events(job_id, cwd)
 
             # Final status
             if exit_code == 0:
@@ -330,6 +337,7 @@ class MLXRunner:
             return False
 
     async def _post_metrics(self, job_id: str, points: List[Dict[str, Any]]):
+        """Post metrics to the API. Accepts legacy dict format or new scalar format."""
         try:
             url = f"{self.api_base_url}/api/jobs/{job_id}/metrics"
             async with self.session.post(url, json=points) as resp:
@@ -337,6 +345,90 @@ class MLXRunner:
                     logger.debug("Metrics POST → %d", resp.status)
         except Exception as e:
             logger.debug("Metrics POST failed: %s", e)
+
+    async def _read_tensorboard_events(self, job_id: str, cwd: str):
+        """
+        Scan for TensorBoard event files in common directories under `cwd`,
+        read scalar summaries via EventAccumulator, and POST them to the API.
+
+        Also checks runs/<job_id>/ directly so scripts that write to
+        SummaryWriter(f"runs/{os.environ['JOB_ID']}") are auto-discovered.
+        """
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        except ImportError:
+            logger.debug("TensorBoard not installed — skipping event file scan")
+            return
+
+        cwd_path = Path(cwd)
+
+        # Candidate directories: named dirs + job-specific subdirs
+        candidate_dirs: List[Path] = []
+        for dirname in TB_SCAN_DIRS:
+            d = cwd_path / dirname
+            if d.is_dir():
+                candidate_dirs.append(d)
+                # Also check job-specific sub-directory
+                job_sub = d / job_id
+                if job_sub.is_dir():
+                    candidate_dirs.append(job_sub)
+
+        if not candidate_dirs:
+            logger.debug("No TensorBoard log directories found for job %s in %s", job_id, cwd)
+            return
+
+        total_scalars = 0
+        for log_dir in candidate_dirs:
+            scalars_posted = await self._process_tb_directory(job_id, log_dir)
+            total_scalars += scalars_posted
+
+        if total_scalars > 0:
+            logger.info("📊 Posted %d TensorBoard scalar points for job %s", total_scalars, job_id)
+
+    async def _process_tb_directory(self, job_id: str, log_dir: Path) -> int:
+        """Read one TensorBoard log directory and POST its scalar data. Returns count posted."""
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        except ImportError:
+            return 0
+
+        try:
+            ea = EventAccumulator(str(log_dir))
+            ea.Reload()
+        except Exception as e:
+            logger.debug("EventAccumulator failed for %s: %s", log_dir, e)
+            return 0
+
+        tags = ea.Tags().get('scalars', [])
+        if not tags:
+            return 0
+
+        batch: List[Dict[str, Any]] = []
+        total = 0
+        BATCH = 200  # POST in batches to avoid huge payloads
+
+        for tag in tags:
+            try:
+                events = ea.Scalars(tag)
+            except Exception:
+                continue
+            for event in events:
+                batch.append({
+                    'tag': tag,
+                    'step': int(event.step),
+                    'value': float(event.value),
+                    'wall_time': float(event.wall_time),
+                })
+                total += 1
+                if len(batch) >= BATCH:
+                    await self._post_metrics(job_id, batch)
+                    batch = []
+
+        if batch:
+            await self._post_metrics(job_id, batch)
+
+        logger.debug("TensorBoard %s: %d tags, %d scalars", log_dir.name, len(tags), total)
+        return total
 
 
 # ─────────────────────────────────────────────────── metric detection helpers

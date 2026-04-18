@@ -65,6 +65,44 @@ export async function initDb(): Promise<void> {
       )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_metrics_job ON job_metrics(job_id)`);
+
+    // Per-scalar metrics table for TensorBoard EventAccumulator pipeline
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS job_metrics_scalars (
+        id          SERIAL PRIMARY KEY,
+        job_id      TEXT NOT NULL,
+        tag         TEXT NOT NULL,
+        step        INTEGER NOT NULL,
+        value       DOUBLE PRECISION NOT NULL,
+        wall_time   DOUBLE PRECISION NOT NULL DEFAULT 0,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (job_id, tag, step)
+      )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_metrics_scalars_job ON job_metrics_scalars(job_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_metrics_scalars_job_tag ON job_metrics_scalars(job_id, tag, step)`);
+
+    // Media and artifacts table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS job_media (
+        id           SERIAL PRIMARY KEY,
+        job_id       TEXT NOT NULL,
+        filename     VARCHAR(512) NOT NULL,
+        tag          VARCHAR(255),
+        step         INTEGER,
+        wall_time    DOUBLE PRECISION,
+        media_type   VARCHAR(64)  NOT NULL DEFAULT 'image',
+        content_type VARCHAR(128) NOT NULL DEFAULT 'image/png',
+        file_size    INTEGER,
+        width        INTEGER,
+        height       INTEGER,
+        created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        UNIQUE(job_id, filename)
+      )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_job_media_job_id ON job_media(job_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_job_media_tag ON job_media(job_id, tag)`);
+
     initialized = true;
   } finally {
     client.release();
