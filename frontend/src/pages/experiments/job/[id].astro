@@ -3,6 +3,7 @@ import Layout from '../../../layouts/Layout.astro';
 import ExperimentDashboard from '../../../components/pytorch/ExperimentDashboard.tsx';
 import { MetricsChart } from '../../../components/pytorch/MetricsChart.tsx';
 import { HyperparameterDisplay } from '../../../components/pytorch/HyperparameterDisplay.tsx';
+import MediaPanel from '../../../components/pytorch/MediaPanel.tsx';
 
 // Enable server-side rendering for dynamic routes
 export const prerender = false;
@@ -90,6 +91,12 @@ const { id } = Astro.params;
 
         <!-- Hyperparameters / CLI args -->
         <HyperparameterDisplay client:only="react" jobId={id} />
+
+        <!-- Rich media: images, renders, artifacts -->
+        <div>
+          <h2 class="text-lg font-semibold text-gray-900 mb-3">Media &amp; Artifacts</h2>
+          <MediaPanel client:only="react" jobId={id} />
+        </div>
       </div>
     </main>
   </div>

@@ -323,7 +323,7 @@ export function AnalyticsDashboard() {
           {/* Tab navigation */}
           <div className="border-b border-gray-200">
             <div className="flex -mb-px">
-              {(['overview', 'trends', 'leaderboard'] as const).map(tab => (
+              {(['overview', 'trends', 'leaderboard'] as const).map((tab: string) => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
@@ -427,6 +427,19 @@ export function AnalyticsDashboard() {
                       <option value="failed">Failed</option>
                     </select>
                   </div>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div className="flex-1" />
+                  <a
+                    href="/analysis"
+                    className="text-sm text-indigo-600 hover:text-indigo-800 font-medium flex items-center gap-1"
+                  >
+                    Advanced Hyperparameter Analysis
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                    </svg>
+                  </a>
                 </div>
 
                 <div className="overflow-x-auto rounded-lg ring-1 ring-gray-200">

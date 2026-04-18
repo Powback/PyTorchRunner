@@ -54,8 +54,7 @@ services:
   frontend:
     build: ./frontend
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:4321:4321"
+    # No host port — accessed via Traefik at pytorch.pow
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.pytorch.rule=Host(`pytorch.pow`)"
@@ -70,10 +69,12 @@ services:
       - PORT=4321
       - DATABASE_URL=postgresql://pytorch:pytorch_secret@postgres:5432/pytorchrunner
       - REDIS_URL=redis://redis:6379
+      - ARTIFACTS_DIR=/artifacts
     volumes:
       - ./frontend/src:/app/src:rw
       - ./frontend/public:/app/public:rw
       - /app/node_modules
+      - artifacts-data:/artifacts
     depends_on:
       postgres:
         condition: service_healthy
@@ -116,4 +117,6 @@ volumes:
   redis-insight-data:
     driver: local
   postgres-data:
+    driver: local
+  artifacts-data:
     driver: local

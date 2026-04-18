@@ -10,6 +10,7 @@ Architecture:
   (Astro API)                (worker, has MPS/MLX access)
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ import uuid
 import aiohttp
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,27 @@ POLL_INTERVAL = 2          # seconds between job polls
 OUTPUT_FLUSH_LINES = 5     # stream output every N lines
 METRICS_BATCH_SIZE = 10    # batch metrics before posting
 TB_SCAN_DIRS = ['runs', 'logs', 'tensorboard', 'tb_logs']  # dirs to scan for TensorBoard events
+
+# Artifact file patterns to collect after job completion
+# (glob pattern, media_type, content_type)
+ARTIFACT_PATTERNS: List[Tuple[str, str, str]] = [
+    ('results/**/*.json',      'json',       'application/json'),
+    ('results/*.json',         'json',       'application/json'),
+    ('out/**/*.png',           'image',      'image/png'),
+    ('out/**/*.jpg',           'image',      'image/jpeg'),
+    ('out/*.png',              'image',      'image/png'),
+    ('out/*.jpg',              'image',      'image/jpeg'),
+    ('renders/**/*.png',       'image',      'image/png'),
+    ('renders/**/*.jpg',       'image',      'image/jpeg'),
+    ('renders/*.png',          'image',      'image/png'),
+    ('checkpoints/**/*.pt',    'checkpoint', 'application/octet-stream'),
+    ('checkpoints/**/*.pth',   'checkpoint', 'application/octet-stream'),
+    ('checkpoints/**/*.safetensors', 'checkpoint', 'application/octet-stream'),
+    ('*.json',                 'json',       'application/json'),
+    ('output/**/*.png',        'image',      'image/png'),
+    ('samples/**/*.png',       'image',      'image/png'),
+]
+MAX_ARTIFACT_SIZE_MB = 50  # skip files larger than this
 
 
 class MLXRunner:
@@ -225,8 +247,11 @@ class MLXRunner:
             if metrics_buf:
                 await self._post_metrics(job_id, metrics_buf)
 
-            # Read TensorBoard event files after the job finishes
+            # Read TensorBoard event files and upload images/scalars
             await self._read_tensorboard_events(job_id, cwd)
+
+            # Scan artifact directories and upload files
+            await self._scan_and_upload_artifacts(job_id, cwd)
 
             # Final status
             if exit_code == 0:
@@ -346,6 +371,84 @@ class MLXRunner:
         except Exception as e:
             logger.debug("Metrics POST failed: %s", e)
 
+    async def _upload_media(
+        self,
+        job_id: str,
+        file_path: Path,
+        *,
+        tag: Optional[str] = None,
+        step: Optional[int] = None,
+        wall_time: Optional[float] = None,
+        media_type: str = 'image',
+        content_type: str = 'image/png',
+        data_bytes: Optional[bytes] = None,
+    ) -> bool:
+        """Upload a single file to POST /api/jobs/:id/media. Returns True on success."""
+        try:
+            if data_bytes is None:
+                data_bytes = file_path.read_bytes()
+            payload: Dict[str, Any] = {
+                'filename': file_path.name,
+                'tag': tag,
+                'step': step,
+                'wall_time': wall_time,
+                'media_type': media_type,
+                'content_type': content_type,
+                'data': base64.b64encode(data_bytes).decode('ascii'),
+            }
+            url = f"{self.api_base_url}/api/jobs/{job_id}/media"
+            async with self.session.post(url, json=payload,
+                                         timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                ok = resp.status in (200, 201)
+                if not ok:
+                    logger.debug("Media upload %s → %d", file_path.name, resp.status)
+                return ok
+        except Exception as e:
+            logger.debug("Media upload failed for %s: %s", file_path.name, e)
+            return False
+
+    async def _scan_and_upload_artifacts(self, job_id: str, cwd: str):
+        """
+        After job completion, scan cwd for artifact files and upload them.
+        Deduplicates by filename.
+        """
+        cwd_path = Path(cwd)
+        uploaded: set = set()
+        total = 0
+        max_bytes = MAX_ARTIFACT_SIZE_MB * 1024 * 1024
+
+        for glob_pat, media_type, content_type in ARTIFACT_PATTERNS:
+            try:
+                matches = list(cwd_path.glob(glob_pat))
+            except Exception:
+                continue
+            for fpath in matches:
+                if not fpath.is_file():
+                    continue
+                if fpath.name in uploaded:
+                    continue
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    continue
+                if size > max_bytes:
+                    logger.debug("Skipping large artifact %s (%.1f MB)", fpath.name, size / 1024 / 1024)
+                    continue
+                # Derive tag from parent directory name (e.g. "results", "renders")
+                tag = fpath.parent.name if fpath.parent != cwd_path else None
+                ok = await self._upload_media(
+                    job_id, fpath,
+                    tag=tag,
+                    media_type=media_type,
+                    content_type=content_type,
+                )
+                if ok:
+                    uploaded.add(fpath.name)
+                    total += 1
+
+        if total > 0:
+            logger.info("📦 Uploaded %d artifact file(s) for job %s", total, job_id)
+
     async def _read_tensorboard_events(self, job_id: str, cwd: str):
         """
         Scan for TensorBoard event files in common directories under `cwd`,
@@ -386,7 +489,7 @@ class MLXRunner:
             logger.info("📊 Posted %d TensorBoard scalar points for job %s", total_scalars, job_id)
 
     async def _process_tb_directory(self, job_id: str, log_dir: Path) -> int:
-        """Read one TensorBoard log directory and POST its scalar data. Returns count posted."""
+        """Read one TensorBoard log directory, POST scalars and images. Returns scalar count."""
         try:
             from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
         except ImportError:
@@ -399,15 +502,15 @@ class MLXRunner:
             logger.debug("EventAccumulator failed for %s: %s", log_dir, e)
             return 0
 
-        tags = ea.Tags().get('scalars', [])
-        if not tags:
-            return 0
+        available_tags = ea.Tags()
 
+        # ── Scalars ────────────────────────────────────────────────────────────
+        scalar_tags = available_tags.get('scalars', [])
         batch: List[Dict[str, Any]] = []
-        total = 0
-        BATCH = 200  # POST in batches to avoid huge payloads
+        total_scalars = 0
+        BATCH = 200
 
-        for tag in tags:
+        for tag in scalar_tags:
             try:
                 events = ea.Scalars(tag)
             except Exception:
@@ -419,7 +522,7 @@ class MLXRunner:
                     'value': float(event.value),
                     'wall_time': float(event.wall_time),
                 })
-                total += 1
+                total_scalars += 1
                 if len(batch) >= BATCH:
                     await self._post_metrics(job_id, batch)
                     batch = []
@@ -427,8 +530,40 @@ class MLXRunner:
         if batch:
             await self._post_metrics(job_id, batch)
 
-        logger.debug("TensorBoard %s: %d tags, %d scalars", log_dir.name, len(tags), total)
-        return total
+        # ── Images ────────────────────────────────────────────────────────────
+        image_tags = available_tags.get('images', [])
+        total_images = 0
+        for tag in image_tags:
+            try:
+                img_events = ea.Images(tag)
+            except Exception:
+                continue
+            for ev in img_events:
+                # ev is a namedtuple: wall_time, step, encoded_image_string, width, height
+                try:
+                    png_bytes = ev.encoded_image_string
+                    safe_tag = tag.replace('/', '_').replace(' ', '_')
+                    filename = f"{safe_tag}_step{ev.step}.png"
+                    ok = await self._upload_media(
+                        job_id,
+                        Path(filename),
+                        tag=tag,
+                        step=int(ev.step),
+                        wall_time=float(ev.wall_time),
+                        media_type='image',
+                        content_type='image/png',
+                        data_bytes=png_bytes,
+                    )
+                    if ok:
+                        total_images += 1
+                except Exception as img_err:
+                    logger.debug("Image upload failed for tag=%s step=%s: %s", tag, ev.step, img_err)
+
+        logger.debug(
+            "TensorBoard %s: %d scalar tags (%d pts), %d image tags (%d imgs)",
+            log_dir.name, len(scalar_tags), total_scalars, len(image_tags), total_images
+        )
+        return total_scalars
 
 
 # ─────────────────────────────────────────────────── metric detection helpers

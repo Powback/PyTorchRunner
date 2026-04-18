@@ -983,6 +983,113 @@ async def list_experiments(
     return [e.model_dump() for e in experiments]
 
 
+@app.get("/experiments/groups", summary="List experiments grouped by namespace")
+async def list_experiment_groups(limit: int = Query(500, ge=1, le=2000)):
+    """
+    Return all experiments grouped by namespace (project).
+    Falls back to SQLite when PostgreSQL is unavailable.
+    """
+    import statistics as _stats
+
+    # Try PostgreSQL first; fall back to SQLite
+    if _db.is_connected:
+        all_exps = await _experiment_store.list(limit=limit)
+        raw = [e.model_dump() for e in all_exps]
+    else:
+        raw = await job_store.list_jobs(limit=limit)
+
+    # Group by namespace
+    groups: Dict[str, list] = {}
+    for exp in raw:
+        ns = exp.get("namespace") or "default"
+        groups.setdefault(ns, []).append(exp)
+
+    result = []
+    for name, runs in groups.items():
+        statuses: Dict[str, int] = {}
+        for r in runs:
+            s = r.get("status", "unknown")
+            statuses[s] = statuses.get(s, 0) + 1
+        result.append({"name": name, "count": len(runs), "status_counts": statuses})
+
+    result.sort(key=lambda g: g["count"], reverse=True)
+    return {"groups": result, "total_runs": len(raw)}
+
+
+@app.get("/experiments/groups/{group}/summary", summary="Aggregated stats for a run group")
+async def get_experiment_group_summary(group: str, limit: int = Query(500, ge=1, le=2000)):
+    """
+    Aggregated statistics for all runs in a namespace group:
+    count by status, best/mean/std per metric, hyperparameter ranges.
+    Falls back to SQLite when PostgreSQL is unavailable.
+    """
+    import statistics as _stats
+
+    if _db.is_connected:
+        all_exps = await _experiment_store.list(limit=limit)
+        raw = [e.model_dump() for e in all_exps if (e.namespace or "default") == group]
+    else:
+        all_raw = await job_store.list_jobs(limit=limit)
+        raw = [r for r in all_raw if (r.get("namespace") or "default") == group]
+
+    if not raw:
+        raise HTTPException(status_code=404, detail=f"Group '{group}' not found")
+
+    # Status breakdown
+    status_counts: Dict[str, int] = {}
+    for r in raw:
+        s = r.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    # Aggregate final metrics (from metrics_summary)
+    all_metrics: Dict[str, List[float]] = {}
+    for r in raw:
+        ms = r.get("metrics_summary") or {}
+        for k, v in ms.items():
+            if isinstance(v, (int, float)):
+                all_metrics.setdefault(k, []).append(float(v))
+
+    metric_stats: Dict[str, Any] = {}
+    for metric, values in all_metrics.items():
+        if not values:
+            continue
+        is_loss = "loss" in metric.lower() or "error" in metric.lower()
+        metric_stats[metric] = {
+            "best": min(values) if is_loss else max(values),
+            "worst": max(values) if is_loss else min(values),
+            "mean": _stats.mean(values),
+            "std": _stats.stdev(values) if len(values) > 1 else 0.0,
+            "min": min(values),
+            "max": max(values),
+            "count": len(values),
+        }
+
+    # Hyperparameter ranges (from env_vars — string keys/values)
+    hp_values: Dict[str, List[Any]] = {}
+    for r in raw:
+        ev = r.get("env_vars") or {}
+        if isinstance(ev, dict):
+            for k, v in ev.items():
+                try:
+                    hp_values.setdefault(k, []).append(float(v))
+                except (TypeError, ValueError):
+                    pass  # skip non-numeric
+
+    hp_ranges: Dict[str, Any] = {}
+    for hp, vals in hp_values.items():
+        if vals:
+            hp_ranges[hp] = {"min": min(vals), "max": max(vals), "count": len(vals)}
+
+    return {
+        "group": group,
+        "total": len(raw),
+        "status_counts": status_counts,
+        "metric_stats": metric_stats,
+        "hp_ranges": hp_ranges,
+        "runs": raw,
+    }
+
+
 @app.get("/experiments/{experiment_id}", summary="Get full experiment record")
 async def get_experiment(experiment_id: str):
     """Get full experiment details from PostgreSQL. Falls back to SQLite/memory."""

@@ -191,6 +191,43 @@ class PyTorchAPIClient {
     return resp.json();
   }
 
+  // ── Experiment analysis (Tier 3) ──────────────────────────────────────────
+
+  /** List all runs grouped by namespace. Returns {groups, totalRuns}. */
+  async listExperimentGroups(): Promise<{ groups: any[]; totalRuns: number }> {
+    const resp = await fetch(`${this.base}/experiments/groups`);
+    if (!resp.ok) throw new Error(`Failed to list groups: ${resp.statusText}`);
+    return resp.json();
+  }
+
+  /** Aggregated stats + all runs for one namespace group. */
+  async getExperimentGroupSummary(group: string): Promise<any> {
+    const resp = await fetch(`${this.base}/experiments/groups/${encodeURIComponent(group)}`);
+    if (!resp.ok) throw new Error(`Failed to get group summary: ${resp.statusText}`);
+    return resp.json();
+  }
+
+  /** List experiments with optional filters. */
+  async listExperimentsFiltered(params?: {
+    status?: string;
+    tags?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<any[]> {
+    const q = new URLSearchParams();
+    if (params?.status) q.set('status', params.status);
+    if (params?.tags)   q.set('tags', params.tags);
+    if (params?.search) q.set('search', params.search);
+    if (params?.limit)  q.set('limit', String(params.limit));
+    if (params?.offset) q.set('offset', String(params.offset));
+    const qs = q.toString() ? `?${q}` : '';
+    const resp = await fetch(`${this.base}/experiments${qs}`);
+    if (!resp.ok) throw new Error(`Failed to list experiments: ${resp.statusText}`);
+    const data = await resp.json();
+    return Array.isArray(data) ? data : data.experiments ?? [];
+  }
+
   // ── SSE streaming ─────────────────────────────────────────────────────
 
   createJobStream(jobId: string): EventSource {
