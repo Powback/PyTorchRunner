@@ -158,12 +158,13 @@ function ExperimentDashboardInner({ experimentId, jobId, autoRefresh = true }: E
   const [autoScroll, setAutoScroll] = useState(true);
   const [showResourceMonitor, setShowResourceMonitor] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  const [fallbackJob, setFallbackJob] = useState<Record<string, any> | null>(null);
 
   const outputRef = useRef<HTMLDivElement>(null);
   const seenAnomalyKeys = useRef<Set<string>>(new Set());
 
   // Reactive job status via PowSync
-  const { data: jobRows } = useQuery({
+  const { data: jobRows, isLoading: jobLoading } = useQuery({
     table: 'jobs',
     where: jobId ? { job_id: jobId } : undefined,
     subscribe: true,
@@ -179,8 +180,22 @@ function ExperimentDashboardInner({ experimentId, jobId, autoRefresh = true }: E
   // WebSocket connection state
   const { isConnected } = useConnection();
 
-  // Derive typed job fields from raw PowSync row
-  const rawJob = (jobRows ?? [])[0] ?? null;
+  // 3-second fallback: if PowSync hasn't delivered the job row yet, fetch directly
+  useEffect(() => {
+    if (!jobId) return;
+    const timer = setTimeout(async () => {
+      if (!jobRows?.length) {
+        try {
+          const resp = await fetch(`/api/jobs/${jobId}`);
+          if (resp.ok) setFallbackJob(await resp.json());
+        } catch { /* non-critical — PowSync may still arrive */ }
+      }
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [jobId, jobRows?.length]);
+
+  // Derive typed job fields from raw PowSync row (or REST fallback)
+  const rawJob = (jobRows ?? [])[0] ?? fallbackJob ?? null;
   const job = rawJob ? {
     jobId:        rawJob.job_id    as string,
     script:       rawJob.script    as string,

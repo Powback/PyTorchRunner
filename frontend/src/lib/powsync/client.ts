@@ -18,6 +18,10 @@
 
 import { SyncClient } from 'powsync/client';
 
+// Side-effect import: runs @table/@field/@reducer decorators so tableRegistry
+// is populated before any useQuery() call resolves a table name.
+import '../../schemas/pytorch/schema';
+
 function createPowsyncClient(): SyncClient {
   // Derive WebSocket URL from the current page.
   // - In dev: window.location.host is "localhost:4321", Vite proxies /ws → port 1239
