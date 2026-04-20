@@ -72,7 +72,8 @@ function scanDir(dir: string, out: string[]): void {
 
 async function loadViaEsbuild(schemaFiles: string[], logger: any): Promise<any> {
   const cwd = process.cwd();
-  const cacheDir = path.join(cwd, 'node_modules', '.cache', 'powsync-pytorch');
+  // Write cache outside node_modules/ — Node 22 refuses to strip TS inside node_modules/
+  const cacheDir = path.join(cwd, '.powsync-cache');
   if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
   const srcDir = path.join(cwd, 'src');
@@ -100,10 +101,18 @@ async function loadViaEsbuild(schemaFiles: string[], logger: any): Promise<any> 
     entryPoints: [tmpEntry],
     bundle: true,
     format: 'cjs',
-    target: 'es2022',
+    target: 'node18',
     platform: 'node',
     outfile,
-    packages: 'external',
+    // Bundle powsync (TypeScript source) into the CJS output.
+    // Only mark truly-compiled/native packages external so Node 22 never
+    // tries to load TypeScript from node_modules/ at require() time.
+    external: [
+      'pg', 'pg-native', 'pg-cloudflare',
+      'ws', 'ioredis', 'redis',
+      'chokidar', 'esbuild',
+      'node:*',
+    ],
     logLevel: 'warning',
   });
 
