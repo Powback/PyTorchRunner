@@ -2,9 +2,8 @@
  * PyTorchRunner Experiment Dashboard
  * Real-time training metrics, live output, anomaly detection, and early-stopping recommendations.
  *
- * Uses useMetricsBridge (the Powsync bridge) for SSE-to-state sync so that
- * metrics are never double-counted even when the backend emits both explicit
- * "metrics" events and stdout lines containing the same values.
+ * Uses PowSync reactive subscriptions (useQuery) for job status and metrics.
+ * No SSE, no polling — data flows via WebSocket from the PowSync ServerStore.
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react';
@@ -23,10 +22,11 @@ import {
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
+import { PowsyncProvider, useQuery, useConnection } from 'powsync/client';
+import { getPowsyncClient } from '../../lib/powsync/client';
 import { pytorchAPI } from '../../lib/pytorch/api-client';
-import { useMetricsBridge } from '../../lib/pytorch/useMetricsBridge';
 import { ResourceMonitor } from './ResourceMonitor';
-import type { PyTorchJob, MetricsChartData } from '../../types/pytorch';
+import type { MetricsChartData } from '../../types/pytorch';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -145,61 +145,99 @@ function alertId() {
   return Math.random().toString(36).slice(2, 9);
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+function parseTs(s: string | null | undefined): number {
+  return s ? new Date(s).getTime() : 0;
+}
 
-export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }: ExperimentDashboardProps) {
-  const [job, setJob] = useState<PyTorchJob | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+// ── Inner component — uses PowSync hooks ──────────────────────────────────────
+
+function ExperimentDashboardInner({ experimentId, jobId, autoRefresh = true }: ExperimentDashboardProps) {
   const [selectedMetrics, setSelectedMetrics] = useState<Set<string>>(new Set(['loss']));
   const [anomalyAlerts, setAnomalyAlerts] = useState<AnomalyAlert[]>([]);
   const [earlyStop, setEarlyStop] = useState<{ recommend: boolean; reason: string }>({ recommend: false, reason: '' });
   const [autoScroll, setAutoScroll] = useState(true);
   const [showResourceMonitor, setShowResourceMonitor] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   const outputRef = useRef<HTMLDivElement>(null);
   const seenAnomalyKeys = useRef<Set<string>>(new Set());
 
-  // ── Powsync bridge — SSE → reactive state ────────────────────────────
-  const {
-    metricsData,
-    outputLines,
-    status: bridgeStatus,
-    progress: bridgeProgress,
-    isConnected,
-    connectionError,
-  } = useMetricsBridge(jobId, autoRefresh);
+  // Reactive job status via PowSync
+  const { data: jobRows } = useQuery({
+    table: 'jobs',
+    where: jobId ? { job_id: jobId } : undefined,
+    subscribe: true,
+  });
 
-  // ── Load initial job metadata ─────────────────────────────────────────
+  // Reactive metrics via PowSync
+  const { data: metricRows } = useQuery({
+    table: 'job_metrics_scalars',
+    where: jobId ? { job_id: jobId } : undefined,
+    subscribe: true,
+  });
 
-  useEffect(() => {
-    if (!jobId) return;
-    let mounted = true;
-    pytorchAPI
-      .getJobStatus(jobId)
-      .then(data => { if (mounted) setJob(data); })
-      .catch(err => { if (mounted) setLoadError(err instanceof Error ? err.message : 'Failed to load job'); });
-    return () => { mounted = false; };
-  }, [jobId]);
+  // WebSocket connection state
+  const { isConnected } = useConnection();
 
-  // ── Sync bridge status back into job state ────────────────────────────
+  // Derive typed job fields from raw PowSync row
+  const rawJob = (jobRows ?? [])[0] ?? null;
+  const job = rawJob ? {
+    jobId:        rawJob.job_id    as string,
+    script:       rawJob.script    as string,
+    status:       rawJob.status    as string,
+    progress:     Number(rawJob.progress ?? 0),
+    startedAt:    parseTs(rawJob.started_at   as string | undefined),
+    completedAt:  parseTs(rawJob.completed_at  as string | undefined),
+    stdoutPreview: (rawJob.stdout_preview as string | null) ?? '',
+    stderrPreview: (rawJob.stderr_preview as string | null) ?? '',
+  } : null;
 
-  useEffect(() => {
-    setJob(prev =>
-      prev ? { ...prev, status: bridgeStatus as any, progress: bridgeProgress } : prev
-    );
-  }, [bridgeStatus, bridgeProgress]);
+  // Build metricsData: { steps: number[], [tag]: number[] }
+  const metricsData = useMemo<Record<string, number[]>>(() => {
+    const rows = metricRows ?? [];
+    const byTag = new Map<string, Map<number, number>>();
+    for (const row of rows) {
+      const tag = row.tag as string;
+      const step = Number(row.step);
+      const value = Number(row.value);
+      if (!byTag.has(tag)) byTag.set(tag, new Map());
+      byTag.get(tag)!.set(step, value);
+    }
+    const allSteps = [...new Set(rows.map(r => Number(r.step)))].sort((a, b) => a - b);
+    const result: Record<string, number[]> = { steps: allSteps };
+    for (const [tag, stepMap] of byTag.entries()) {
+      result[tag] = allSteps.map(s => stepMap.get(s) ?? NaN);
+    }
+    return result;
+  }, [metricRows]);
 
-  // ── Auto-scroll output terminal ───────────────────────────────────────
+  // Parse stdout/stderr preview as output lines for the terminal
+  const outputLines = useMemo(() => {
+    if (!job) return [] as Array<{ lineNo: number; line: string; stream: 'stdout' | 'stderr' }>;
+    const lines: Array<{ lineNo: number; line: string; stream: 'stdout' | 'stderr' }> = [];
+    let idx = 0;
+    if (job.stdoutPreview) {
+      for (const line of job.stdoutPreview.split('\n')) {
+        lines.push({ lineNo: idx++, line, stream: 'stdout' });
+      }
+    }
+    if (job.stderrPreview) {
+      for (const line of job.stderrPreview.split('\n')) {
+        lines.push({ lineNo: idx++, line, stream: 'stderr' });
+      }
+    }
+    return lines;
+  }, [job?.stdoutPreview, job?.stderrPreview]);
 
+  // Auto-scroll output terminal
   useEffect(() => {
     if (autoScroll && outputRef.current) {
       outputRef.current.scrollTo({ top: outputRef.current.scrollHeight, behavior: 'smooth' });
     }
   }, [outputLines.length, autoScroll]);
 
-  // ── Anomaly detection ─────────────────────────────────────────────────
-
-  const loss = (metricsData.loss as number[] | undefined) ?? [];
+  // Anomaly detection
+  const loss     = (metricsData.loss     as number[] | undefined) ?? [];
   const accuracy = (metricsData.accuracy as number[] | undefined) ?? [];
   const val_loss = (metricsData.val_loss as number[] | undefined) ?? [];
 
@@ -220,20 +258,17 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
     setEarlyStop(shouldRecommendEarlyStopping(loss, val_loss));
   }, [loss.length]);
 
-  // ── Chart data ────────────────────────────────────────────────────────
-
-  // All metric keys present in the current metrics data
+  // Chart data
   const availableMetricKeys = useMemo(
-    () => Object.keys(metricsData).filter(k => k !== 'steps' && k !== 'timestamps' && Array.isArray(metricsData[k]) && (metricsData[k] as number[]).length > 0),
+    () => Object.keys(metricsData).filter(k => k !== 'steps' && Array.isArray(metricsData[k]) && metricsData[k].some(v => !isNaN(v))),
     [metricsData],
   );
 
   const chartData: MetricsChartData = useMemo(() => {
     const datasets: MetricsChartData['datasets'] = [];
-
     availableMetricKeys.forEach(key => {
       if (!selectedMetrics.has(key)) return;
-      const data = metricsData[key] as number[];
+      const data = metricsData[key];
       const color = METRIC_COLORS[key] ?? { border: 'rgb(107,114,128)', bg: 'rgba(107,114,128,0.1)' };
       datasets.push({
         label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
@@ -243,7 +278,6 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
         tension: 0.3,
       });
     });
-
     return { datasets };
   }, [metricsData, selectedMetrics, availableMetricKeys]);
 
@@ -257,11 +291,12 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
 
   const handleCancelJob = async () => {
     if (!jobId) return;
+    setCancelError(null);
     try {
       await pytorchAPI.cancelJob(jobId);
-      setJob(prev => prev ? { ...prev, status: 'cancelled' } : prev);
+      // No need to setJob — PowSync will reactively update when the API writes to PostgreSQL
     } catch (err) {
-      setLoadError(err instanceof Error ? err.message : 'Failed to cancel job');
+      setCancelError(err instanceof Error ? err.message : 'Failed to cancel job');
     }
   };
 
@@ -284,9 +319,9 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
   return (
     <div className="space-y-6">
       {/* Error banner */}
-      {loadError && !job && (
+      {cancelError && (
         <div className="bg-red-50 border border-red-200 rounded-md p-4">
-          <p className="text-sm text-red-800">{loadError}</p>
+          <p className="text-sm text-red-800">{cancelError}</p>
         </div>
       )}
 
@@ -333,7 +368,7 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
           <div className="flex items-center justify-between mb-4">
             <div>
               <h2 className="text-lg font-semibold text-gray-900">Job {job.jobId}</h2>
-              <p className="text-sm text-gray-500">Experiment {experimentId ?? 'Unknown'}</p>
+              <p className="text-sm text-gray-500">{job.script || experimentId || jobId?.slice(0, 12) || 'Unknown'}</p>
             </div>
             <div className="flex items-center space-x-3">
               <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(job.status)}`}>
@@ -341,7 +376,7 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
               </span>
               <div
                 className={`h-3 w-3 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}
-                title={isConnected ? 'Live — metrics streaming' : 'Disconnected'}
+                title={isConnected ? 'Live via PowSync' : 'Disconnected'}
               />
             </div>
           </div>
@@ -382,9 +417,9 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
             </div>
           </div>
 
-          {connectionError && (
-            <div className="mt-4 bg-red-50 border border-red-200 rounded-md p-3">
-              <p className="text-sm text-red-800">{connectionError}</p>
+          {!isConnected && (
+            <div className="mt-4 bg-yellow-50 border border-yellow-200 rounded-md p-3">
+              <p className="text-sm text-yellow-800">PowSync disconnected — reconnecting…</p>
             </div>
           )}
         </div>
@@ -400,7 +435,7 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
 
           <div className="flex flex-wrap gap-2">
             {availableMetricKeys.map(key => {
-              const data = metricsData[key] as number[];
+              const data = metricsData[key];
               const color = METRIC_COLORS[key] ?? { border: 'rgb(107,114,128)', bg: '' };
               return (
                 <button
@@ -413,7 +448,7 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
                   }`}
                   style={selectedMetrics.has(key) ? { backgroundColor: color.border, borderColor: color.border } : {}}
                 >
-                  {key.replace(/_/g, ' ')} ({data.length})
+                  {key.replace(/_/g, ' ')} ({data.filter(v => !isNaN(v)).length})
                 </button>
               );
             })}
@@ -476,6 +511,30 @@ export function ExperimentDashboard({ experimentId, jobId, autoRefresh = true }:
         </div>
       </div>
     </div>
+  );
+}
+
+// ── Public export — self-contained with PowsyncProvider ──────────────────────
+
+export function ExperimentDashboard(props: ExperimentDashboardProps) {
+  const [client] = useState(() =>
+    typeof window !== 'undefined' ? getPowsyncClient() : null
+  );
+
+  if (!client) {
+    return (
+      <div className="space-y-6 animate-pulse">
+        <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6 h-32" />
+        <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6 h-80" />
+        <div className="bg-white shadow-sm ring-1 ring-gray-900/5 rounded-lg p-6 h-80" />
+      </div>
+    );
+  }
+
+  return (
+    <PowsyncProvider client={client}>
+      <ExperimentDashboardInner {...props} />
+    </PowsyncProvider>
   );
 }
 

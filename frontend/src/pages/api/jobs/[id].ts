@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro';
 import { query } from '../../../lib/db';
+import { notifyJobChanged } from '../../../lib/powsync/dispatch';
 export const prerender = false;
 
 export const GET: APIRoute = async ({ params }) => {
@@ -87,7 +88,34 @@ export const PATCH: APIRoute = async ({ params, request }) => {
     });
   }
 
-  return new Response(JSON.stringify(result.rows[0]), {
+  const row = result.rows[0];
+
+  // Notify PowSync subscribers (fire-and-forget — PostgreSQL is source of truth)
+  notifyJobChanged({
+    job_id: row.job_id,
+    namespace: row.namespace,
+    script: row.script,
+    args: row.args,
+    cwd: row.cwd,
+    env_vars: row.env_vars,
+    job_name: row.job_name,
+    tags: row.tags,
+    status: row.status,
+    progress: parseFloat(row.progress) || 0,
+    stdout_preview: row.stdout_preview,
+    stderr_preview: row.stderr_preview,
+    stdout_line_count: row.stdout_line_count || 0,
+    stderr_line_count: row.stderr_line_count || 0,
+    runner_id: row.runner_id || '',
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : '',
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : '',
+    started_at: row.started_at ? new Date(row.started_at).toISOString() : '',
+    completed_at: row.completed_at ? new Date(row.completed_at).toISOString() : '',
+    exit_code: row.exit_code || 0,
+    error: row.error || '',
+  });
+
+  return new Response(JSON.stringify(row), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });

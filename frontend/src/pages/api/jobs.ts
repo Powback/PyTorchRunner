@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro';
 import { query } from '../../lib/db';
+import { notifyJobChanged } from '../../lib/powsync/dispatch';
 export const prerender = false;
 
 export const GET: APIRoute = async ({ url }) => {
@@ -70,7 +71,34 @@ export const POST: APIRoute = async ({ request }) => {
     [job_id, namespace, script, JSON.stringify(args), cwd, JSON.stringify(env_vars), job_name, JSON.stringify(tags)]
   );
 
-  return new Response(JSON.stringify(result.rows[0]), {
+  const row = result.rows[0];
+
+  // Notify PowSync subscribers — new job is now visible in real-time
+  notifyJobChanged({
+    job_id: row.job_id,
+    namespace: row.namespace,
+    script: row.script,
+    args: row.args,
+    cwd: row.cwd,
+    env_vars: row.env_vars,
+    job_name: row.job_name,
+    tags: row.tags,
+    status: row.status,
+    progress: 0,
+    stdout_preview: '',
+    stderr_preview: '',
+    stdout_line_count: 0,
+    stderr_line_count: 0,
+    runner_id: '',
+    created_at: row.created_at ? new Date(row.created_at).toISOString() : '',
+    updated_at: row.updated_at ? new Date(row.updated_at).toISOString() : '',
+    started_at: '',
+    completed_at: '',
+    exit_code: 0,
+    error: '',
+  });
+
+  return new Response(JSON.stringify(row), {
     status: 201,
     headers: { 'Content-Type': 'application/json' },
   });

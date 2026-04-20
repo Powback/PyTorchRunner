@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro';
 import { query } from '../../../../lib/db';
+import { notifyMetricsChanged } from '../../../../lib/powsync/dispatch';
 
 export const prerender = false;
 
@@ -127,6 +128,9 @@ export const POST: APIRoute = async ({ params, request }) => {
              wall_time = EXCLUDED.wall_time`,
       values
     );
+
+    // Notify PowSync subscribers (fire-and-forget)
+    notifyMetricsChanged(jobId, points);
 
     return new Response(
       JSON.stringify({ inserted: points.length }),

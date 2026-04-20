@@ -135,52 +135,103 @@ import Layout from '../layouts/Layout.astro';
 								</div>
 
 								<div>
-									<h4 class="font-semibold text-blue-800">3. Python SDK</h4>
-									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>import aiohttp
-import asyncio
+									<h4 class="font-semibold text-blue-800">3. Python — Submit &amp; Monitor</h4>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>import requests, time
 
-async def submit_job():
-    async with aiohttp.ClientSession() as session:
-        job_data = {
-            "script": "train.py",
-            "args": ["--lr", "0.01", "--epochs", "100"],
-            "namespace": "my_experiment",
-            "cwd": "/path/to/project"
-        }
+API = "http://pytorch.pow/api"
 
-        async with session.post(
-            "http://pytorch.pow/api/jobs",
-            json=job_data
-        ) as resp:
-            result = await resp.json()
-            print(f"Job ID: {result['job_id']}")
+# Submit a job
+resp = requests.post(f"{API}/jobs", json={
+    "script": "train.py",
+    "args": ["--lr", "0.01", "--epochs", "100"],
+    "namespace": "my_experiment",
+    "cwd": "/path/to/project"
+})
+job_id = resp.json()["job_id"]
+print(f"Submitted: {job_id}")
 
-asyncio.run(submit_job())</code>`} />
+# Poll until done
+while True:
+    job = requests.get(f"{API}/jobs/{job_id}").json()
+    print(f"Status: {job['status']}  Progress: {job.get('progress', 0):.0%}")
+    if job["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(5)
+
+# Get results
+print(f"Exit code: {job.get('exit_code')}")
+print(f"Output:\\n{job.get('stdout_preview', '')}")</code>`} />
 								</div>
 
 								<div>
-									<h4 class="font-semibold text-blue-800">4. SpecLLM Bridge (MLX Jobs)</h4>
-									<p class="text-sm text-blue-700 mb-2">For MLX/Apple Silicon execution:</p>
-									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code># 1. Start MLX runner on the host:
-PYTORCH_RUNNER_API_URL=http://pytorch.pow MLX_RUNNER_NAMESPACE=specllm python mlx_runner.py
+									<h4 class="font-semibold text-blue-800">4. Python — Metrics &amp; Analysis</h4>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>import requests
 
-# 2. Submit jobs with namespace "specllm":
-curl -X POST http://pytorch.pow/api/jobs \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "script": "mlx_training.py",
-    "args": ["--model", "llama"],
+API = "http://pytorch.pow/api"
+job_id = "your-job-id"
+
+# List all metric tags for a job
+tags = requests.get(f"{API}/jobs/{job_id}/metrics/tags").json()
+for t in tags["tags"]:
+    print(f"{t['tag']}: {t['count']} points, range [{t['min_value']:.4f}, {t['max_value']:.4f}]")
+
+# Get full time-series data for a specific metric
+data = requests.get(f"{API}/jobs/{job_id}/metrics", params={"tag": "loss"}).json()
+for point in data["scalars"]["loss"]:
+    print(f"  step={point['step']}  loss={point['value']:.4f}")
+
+# List all jobs (filter by namespace, status)
+jobs = requests.get(f"{API}/jobs", params={
     "namespace": "specllm",
-    "cwd": "/Users/macback/Projects/SpecLLM"
-  }'</code>`} />
+    "status": "completed",
+    "limit": 10
+}).json()
+for j in jobs:
+    print(f"{j['job_id'][:8]}  {j['script']}  {j['status']}")</code>`} />
+								</div>
+
+								<div>
+									<h4 class="font-semibold text-blue-800">5. TensorBoard Integration</h4>
+									<p class="text-sm text-blue-700 mb-2">Add SummaryWriter to your training script — metrics auto-appear in the dashboard:</p>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code>import os
+from torch.utils.tensorboard import SummaryWriter
+
+# Runner sets JOB_ID automatically
+writer = SummaryWriter(f"runs/{os.environ.get('JOB_ID', 'default')}")
+
+for step in range(10000):
+    loss = train_step()
+    writer.add_scalar("loss", loss, step)
+    writer.add_scalar("eval/reward", evaluate(), step)
+    if step % 500 == 0:
+        writer.add_image("samples", generate_samples(), step)
+writer.close()
+# Runner reads event files → posts to API → charts update at /analysis</code>`} />
+								</div>
+
+								<div>
+									<h4 class="font-semibold text-blue-800">6. Stdout Metrics (Zero Setup)</h4>
+									<p class="text-sm text-blue-700 mb-2">Just print key=value pairs — they're auto-detected:</p>
+									<pre class="mt-2 bg-blue-100 p-3 rounded text-sm overflow-x-auto" set:html={`<code># These stdout formats are automatically parsed:
+print(f"[{step}/{total}] loss={loss:.4f} accuracy={acc:.4f} lr={lr:.6f}")
+# → progress bar + loss/accuracy/lr charts
+
+# SpecLLM format works too:
+# step 100/1000 | loss=4.1852 lm=4.1852 ppl=65.71 | lr=2.70e-05 | 4658 tok/s</code>`} />
 								</div>
 
 								<div class="bg-blue-100 p-3 rounded">
-									<h5 class="font-medium text-blue-800">Architecture Overview:</h5>
-									<p class="text-sm text-blue-700 mt-1">
-										<strong>API:</strong> Astro server at pytorch.pow handles all /api/* routes<br/>
-										<strong>Runner:</strong> mlx_runner.py runs on host, polls /api/jobs and executes with MPS/MLX<br/>
-										<strong>Single URL:</strong> pytorch.pow for everything — UI + API + dashboard
+									<h5 class="font-medium text-blue-800">API Reference:</h5>
+									<p class="text-sm text-blue-700 mt-1 font-mono">
+										POST /api/jobs — Submit job (returns job_id)<br/>
+										GET&nbsp; /api/jobs — List jobs (?status=, ?namespace=, ?limit=)<br/>
+										GET&nbsp; /api/jobs/:id — Job detail (stdout, status, progress)<br/>
+										PATCH /api/jobs/:id — Update job (used by runners)<br/>
+										GET&nbsp; /api/jobs/:id/metrics/tags — Metric tag summary<br/>
+										GET&nbsp; /api/jobs/:id/metrics — Full time-series data (?tag=)<br/>
+										POST&nbsp;/api/jobs/:id/metrics — Post metrics batch<br/>
+										GET&nbsp; /api/health — System health + runner count<br/>
+										GET&nbsp; /api/runners — Connected runners
 									</p>
 								</div>
 							</div>
@@ -273,21 +324,21 @@ curl -X POST http://pytorch.pow/api/jobs \\
 
 			if (statusElement) {
 				statusElement.textContent = health.status;
-				statusElement.className = health.status === 'healthy'
+				statusElement.className = (health.status === 'healthy' || health.status === 'ok')
 					? 'mt-1 text-lg font-semibold text-green-600'
 					: 'mt-1 text-lg font-semibold text-red-600';
 			}
 
 			if (mpsElement) {
-				const runnerCount = health.runners?.connected ?? 0;
-				mpsElement.textContent = runnerCount > 0 ? `${runnerCount} runner(s)` : 'No runners';
-				mpsElement.className = runnerCount > 0
+				const hasMps = health.mpsAvailable || health.mps_available;
+				mpsElement.textContent = hasMps ? 'MPS ✓' : 'CPU only';
+				mpsElement.className = hasMps
 					? 'mt-1 text-lg font-semibold text-green-600'
 					: 'mt-1 text-lg font-semibold text-orange-600';
 			}
 
-			if (queueElement) queueElement.textContent = health.queue_size || 0;
-			if (activeElement) activeElement.textContent = health.active_jobs || 0;
+			if (queueElement) queueElement.textContent = health.queueSize ?? health.queue_size ?? 0;
+			if (activeElement) activeElement.textContent = health.activeJobs ?? health.active_jobs ?? 0;
 		}
 
 		// Load recent jobs
@@ -295,7 +346,8 @@ curl -X POST http://pytorch.pow/api/jobs \\
 			try {
 				const response = await fetch(`${API_BASE}/jobs?limit=5`);
 				const data = await response.json();
-				updateRecentActivity(data.jobs || []);
+				const jobs = Array.isArray(data) ? data : (data.jobs || []);
+				updateRecentActivity(jobs);
 			} catch (error) {
 				console.error('Failed to load recent jobs:', error);
 			}
@@ -327,18 +379,26 @@ curl -X POST http://pytorch.pow/api/jobs \\
 					'queued': 'text-yellow-600 bg-yellow-100'
 				}[job.status] || 'text-gray-600 bg-gray-100';
 
+				const lastOutput = (job.stdout_preview || job.stdoutPreview || job.stderr_preview || job.stderrPreview || '').trim();
+				const lastLine = lastOutput ? lastOutput.split('\n').filter(l => l.trim()).pop() || '' : '';
+				const errorMsg = (job.status === 'failed' && job.error) ? job.error.split('\n').filter(l => l.trim()).pop() || job.error : '';
+
 				return `
-					<div class="flex items-center justify-between py-3">
-						<div class="flex-1 min-w-0">
-							<p class="text-sm font-medium text-gray-900 truncate">${job.script || 'Unknown Script'}</p>
-							<p class="text-sm text-gray-500">${job.namespace || 'default'} • ${new Date(job.created_at).toLocaleString()}</p>
+					<a href="/experiments/job/${job.job_id || job.jobId}" class="block py-3 hover:bg-gray-50 -mx-2 px-2 rounded transition-colors">
+						<div class="flex items-center justify-between">
+							<div class="flex-1 min-w-0">
+								<p class="text-sm font-medium text-gray-900 truncate">${job.script || 'Unknown Script'}</p>
+								<p class="text-sm text-gray-500">${job.namespace || 'default'} • ${(job.created_at || job.createdAt) ? new Date(job.created_at || job.createdAt).toLocaleString() : '—'}</p>
+							</div>
+							<div class="flex-shrink-0">
+								<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColor}">
+									${job.status}
+								</span>
+							</div>
 						</div>
-						<div class="flex-shrink-0">
-							<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${statusColor}">
-								${job.status}
-							</span>
-						</div>
-					</div>
+						${lastLine ? `<p class="mt-1 text-xs font-mono text-gray-400 truncate">${lastLine.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>` : ''}
+						${errorMsg ? `<p class="mt-1 text-xs font-mono text-red-400 truncate">${errorMsg.slice(0, 200).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>` : ''}
+					</a>
 				`;
 			}).join('');
 

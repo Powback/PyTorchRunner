@@ -57,9 +57,14 @@ services:
     # No host port — accessed via Traefik at pytorch.pow
     labels:
       - "traefik.enable=true"
+      # Main HTTP router → Astro on port 4321
       - "traefik.http.routers.pytorch.rule=Host(`pytorch.pow`)"
       - "traefik.http.routers.pytorch.entrypoints=web"
       - "traefik.http.services.pytorch.loadbalancer.server.port=4321"
+      # WebSocket router → PowSync WS server on port 1239
+      - "traefik.http.routers.pytorch-ws.rule=Host(`pytorch.pow`) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.pytorch-ws.entrypoints=web"
+      - "traefik.http.services.pytorch-ws.loadbalancer.server.port=1239"
     networks:
       - default
       - traefik
@@ -67,6 +72,7 @@ services:
       - NODE_ENV=production
       - HOST=0.0.0.0
       - PORT=4321
+      - WS_PORT=1239
       - DATABASE_URL=postgresql://pytorch:pytorch_secret@postgres:5432/pytorchrunner
       - REDIS_URL=redis://redis:6379
       - ARTIFACTS_DIR=/artifacts

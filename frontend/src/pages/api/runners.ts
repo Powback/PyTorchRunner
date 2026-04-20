@@ -1,5 +1,6 @@
 import type { APIRoute } from 'astro';
 import { listRunners, registerRunner } from '../../lib/runners';
+import { notifyRunnerChanged } from '../../lib/powsync/dispatch';
 export const prerender = false;
 
 export const GET: APIRoute = async () => {
@@ -31,6 +32,17 @@ export const POST: APIRoute = async ({ request }) => {
   }
 
   const runner = registerRunner(id, { hostname, capabilities, namespace, currentJob });
+
+  // Notify PowSync subscribers (fire-and-forget)
+  notifyRunnerChanged({
+    id: runner.id,
+    hostname: runner.hostname,
+    capabilities: runner.capabilities,
+    namespace: runner.namespace,
+    current_job: runner.currentJob || '',
+    registered_at: runner.registeredAt,
+    last_seen: runner.lastSeen,
+  });
 
   return new Response(JSON.stringify(runner), {
     status: 200,
