@@ -87,7 +87,7 @@ async function loadViaEsbuild(schemaFiles: string[], logger: any): Promise<any> 
   // Export from the local powsync copy (resolves via node_modules/powsync → file:../../PowSync)
   fs.writeFileSync(tmpEntry, `${schemaImports}\nexport * from 'powsync/server';\n`);
 
-  const outfile = path.join(cacheDir, `bundle-${Date.now()}.cjs`);
+  const outfile = path.join(cacheDir, `bundle-${Date.now()}.mjs`);
 
   let esbuild: typeof import('esbuild');
   try {
@@ -100,13 +100,13 @@ async function loadViaEsbuild(schemaFiles: string[], logger: any): Promise<any> 
   await esbuild.build({
     entryPoints: [tmpEntry],
     bundle: true,
-    format: 'cjs',
+    format: 'esm',      // ESM supports top-level await (PowSync container.ts uses it)
     target: 'node18',
     platform: 'node',
     outfile,
-    // Bundle powsync (TypeScript source) into the CJS output.
+    // Bundle powsync (TypeScript source) into the ESM output.
     // Only mark truly-compiled/native packages external so Node 22 never
-    // tries to load TypeScript from node_modules/ at require() time.
+    // tries to load TypeScript from node_modules/ at import time.
     external: [
       'pg', 'pg-native', 'pg-cloudflare',
       'ws', 'ioredis', 'redis',
@@ -118,8 +118,9 @@ async function loadViaEsbuild(schemaFiles: string[], logger: any): Promise<any> 
 
   try { fs.unlinkSync(tmpEntry); } catch {}
 
-  const mod = _require(outfile);
-  delete _require.cache[_require.resolve(outfile)];
+  // Dynamic ESM import — unique filename per run so Node's module cache doesn't replay stale bundles.
+  // @vite-ignore: runtime path, intentionally not analyzable by Vite's static import scanner.
+  const mod = await import(/* @vite-ignore */ `file://${outfile}`);
   setTimeout(() => { try { fs.unlinkSync(outfile); } catch {} }, 2000);
 
   return mod;
