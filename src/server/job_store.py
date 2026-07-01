@@ -63,6 +63,7 @@ class JobStore:
                 args           TEXT NOT NULL DEFAULT '[]',
                 cwd            TEXT NOT NULL,
                 job_name       TEXT,
+                gpu_type       TEXT,
                 status         TEXT NOT NULL DEFAULT 'queued',
                 progress       REAL NOT NULL DEFAULT 0.0,
                 created_at     TEXT NOT NULL,
@@ -75,6 +76,12 @@ class JobStore:
                 error          TEXT
             )
         """)
+        # Migration: add gpu_type to existing DBs that predate this column
+        try:
+            await self._db.execute("ALTER TABLE jobs ADD COLUMN gpu_type TEXT")
+            await self._db.commit()
+        except Exception:
+            pass  # column already exists
         # Indices for the common filter patterns
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_namespace"
@@ -103,11 +110,11 @@ class JobStore:
         await self._db.execute(
             """
             INSERT OR REPLACE INTO jobs
-              (job_id, namespace, script, args, cwd, job_name,
+              (job_id, namespace, script, args, cwd, job_name, gpu_type,
                status, progress, created_at, updated_at,
                started_at, completed_at, exit_code,
                stdout_preview, stderr_preview, error)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 job_data["job_id"],
@@ -116,6 +123,7 @@ class JobStore:
                 json.dumps(job_data.get("args", [])),
                 job_data["cwd"],
                 job_data.get("job_name"),
+                job_data.get("gpu_type"),
                 job_data.get("status", "queued"),
                 job_data.get("progress", 0.0),
                 job_data["created_at"],

@@ -133,6 +133,7 @@ class ScriptExecutionRequest(BaseModel):
     job_name: Optional[str] = None
     namespace: str = "default"
     tags: List[str] = []
+    gpu_type: Optional[str] = None  # "mps", "3090", "5090", "any", or None (any)
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +244,7 @@ async def run_script(request: ScriptExecutionRequest, background_tasks: Backgrou
         "env_vars": request.env_vars,
         "job_name": request.job_name or f"script-{job_id[:8]}",
         "tags": request.tags,
+        "gpu_type": request.gpu_type,
         "status": "queued",
         "progress": 0.0,
         "created_at": now,
