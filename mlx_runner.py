@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import socket
 import sys
 import time
@@ -31,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger('mlx_runner')
 
 POLL_INTERVAL = 2          # seconds between job polls
-OUTPUT_FLUSH_LINES = 5     # stream output every N lines
+OUTPUT_FLUSH_LINES = 20    # stream output preview every N lines
 METRICS_BATCH_SIZE = 10    # batch metrics before posting
 TB_SCAN_DIRS = ['runs', 'logs', 'tensorboard', 'tb_logs']  # dirs to scan for TensorBoard events
 
@@ -76,6 +77,11 @@ class MLXRunner:
         )
         self.running = True
 
+        # Install signal handlers so SIGTERM/SIGINT trigger a clean deregister
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self._shutdown()))
+
         logger.info("🚀 MLX Runner starting  runner_id=%s", self.runner_id)
         logger.info("📡 API: %s", self.api_base_url)
         logger.info("🏷️  Namespace: %s", self.namespace)
@@ -85,6 +91,16 @@ class MLXRunner:
         await self._register()
 
         logger.info("✅ Ready — polling for jobs every %ds", POLL_INTERVAL)
+
+        # Background heartbeat — sends status + current_job every 30s
+        async def _heartbeat_loop():
+            while self.running:
+                await asyncio.sleep(30)
+                try:
+                    await self._register()
+                except Exception:
+                    pass
+        asyncio.create_task(_heartbeat_loop())
 
         while self.running:
             try:
@@ -98,8 +114,13 @@ class MLXRunner:
 
         await self.stop()
 
+    async def _shutdown(self):
+        """Graceful shutdown triggered by SIGTERM/SIGINT."""
+        self.running = False
+
     async def stop(self):
         self.running = False
+        await self._deregister()
         if self.session:
             await self.session.close()
         logger.info("🛑 MLX Runner stopped")
@@ -160,26 +181,42 @@ class MLXRunner:
                 'hostname': self.hostname,
                 'namespace': self.namespace,
                 'capabilities': self.capabilities,
+                'status': 'busy' if self.current_job else 'idle',
+                'current_job': self.current_job,
+                'gpu_type': 'mps' if self.capabilities.get('mps') else None,
             }
             async with self.session.post(f"{self.api_base_url}/api/runners", json=payload) as resp:
                 if resp.status == 200:
-                    logger.info("✅ Registered as runner %s", self.runner_id)
+                    logger.debug("✅ Registered as runner %s  status=%s", self.runner_id, payload['status'])
                 else:
                     logger.warning("⚠️  Runner registration returned %d", resp.status)
         except Exception as e:
             logger.warning("⚠️  Runner registration failed: %s", e)
+
+    async def _deregister(self):
+        if not self.session:
+            return
+        try:
+            url = f"{self.api_base_url}/api/runners/{self.runner_id}"
+            async with self.session.delete(url) as resp:
+                if resp.status == 200:
+                    logger.info("👋 Runner %s deregistered", self.runner_id)
+                else:
+                    logger.warning("⚠️  Deregister returned %d", resp.status)
+        except Exception as e:
+            logger.warning("⚠️  Deregister failed: %s", e)
 
     async def _poll_and_run(self):
         if self.current_job:
             return  # busy
 
         try:
-            url = f"{self.api_base_url}/api/jobs?status=queued&namespace={self.namespace}&limit=1"
+            url = f"{self.api_base_url}/api/jobs?status=queued&limit=1"
             async with self.session.get(url) as resp:
                 if resp.status != 200:
                     return
                 data = await resp.json()
-                jobs = data.get('jobs', [])
+                jobs = data if isinstance(data, list) else data.get('jobs', [])
 
             if not jobs:
                 return
@@ -203,6 +240,7 @@ class MLXRunner:
                 'status': 'running',
                 'runner_id': self.runner_id,
                 'progress': 0.05,
+                'started_at': datetime.utcnow().isoformat(),
             })
             if not claimed:
                 logger.info("⏭️  Job %s already claimed, skipping", job_id)
@@ -228,6 +266,9 @@ class MLXRunner:
             # Expose job ID so training scripts can write TensorBoard events to the right dir
             env['JOB_ID'] = job_id
             env['PYTORCHRUNNER_JOB_ID'] = job_id
+            metrics_file = f'/tmp/pytorchrunner/{job_id}/metrics.jsonl'
+            os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+            env['PYTORCHRUNNER_METRICS'] = metrics_file
             env.update({k: str(v) for k, v in env_vars.items()})
 
             start = time.time()
@@ -261,8 +302,6 @@ class MLXRunner:
                     'progress': 1.0,
                     'exit_code': 0,
                     'runner_id': self.runner_id,
-                    'stdout_full': '\n'.join(stdout_lines),
-                    'stderr_full': '\n'.join(stderr_lines),
                     'stdout_preview': '\n'.join(stdout_lines[-50:]),
                     'stderr_preview': '\n'.join(stderr_lines[-20:]),
                     'stdout_line_count': len(stdout_lines),
@@ -276,8 +315,6 @@ class MLXRunner:
                     'exit_code': exit_code,
                     'error': f"Process exited with code {exit_code}",
                     'runner_id': self.runner_id,
-                    'stdout_full': '\n'.join(stdout_lines),
-                    'stderr_full': '\n'.join(stderr_lines),
                     'stdout_preview': '\n'.join(stdout_lines[-50:]),
                     'stderr_preview': '\n'.join(stderr_lines[-20:]),
                     'stdout_line_count': len(stdout_lines),
@@ -295,6 +332,23 @@ class MLXRunner:
         finally:
             self.current_job = None
 
+    async def _check_cancelled(self, job_id: str, process: asyncio.subprocess.Process) -> None:
+        """Periodically check if job was cancelled in DB. Kill process if so."""
+        while process.returncode is None:
+            await asyncio.sleep(5)
+            try:
+                url = f"{self.api_base_url}/api/jobs/{job_id}"
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        status = data.get('status') if isinstance(data, dict) else None
+                        if status in ('cancelled', 'failed'):
+                            logger.info("🛑 Job %s cancelled remotely — killing process", job_id)
+                            process.kill()
+                            return
+            except Exception:
+                pass
+
     async def _stream_output(
         self, job_id: str, process: asyncio.subprocess.Process
     ):
@@ -304,6 +358,9 @@ class MLXRunner:
         metrics_buf: List[Dict[str, Any]] = []
         pending_flush = False
         step_counter = [0]
+
+        # Background cancellation checker
+        cancel_task = asyncio.create_task(self._check_cancelled(job_id, process))
 
         async def read_stream(stream, lines_list, is_stderr: bool):
             nonlocal pending_flush
@@ -319,8 +376,15 @@ class MLXRunner:
                     # Try to detect metrics from stdout
                     m = _detect_metrics(line)
                     if m:
-                        step_counter[0] += 1
-                        metrics_buf.append({'step': step_counter[0], 'metrics': m})
+                        step = m.pop('_step', None) or step_counter[0] + 1
+                        total_steps = m.pop('_total', None)
+                        step_counter[0] = step
+                        metrics_buf.append({'step': step, 'metrics': m})
+                        # Update job progress if we know the total
+                        if total_steps and total_steps > 0:
+                            await self._patch_job(job_id, {
+                                'progress': min(step / total_steps, 0.99),
+                            }, silent=True)
                         if len(metrics_buf) >= METRICS_BATCH_SIZE:
                             await self._post_metrics(job_id, metrics_buf[:])
                             metrics_buf.clear()
@@ -341,6 +405,7 @@ class MLXRunner:
             read_stream(process.stdout, stdout_lines, False),
             read_stream(process.stderr, stderr_lines, True),
         )
+        cancel_task.cancel()
 
         return stdout_lines, stderr_lines, metrics_buf
 
@@ -581,10 +646,14 @@ _KV = re.compile(
 )
 
 
+_PROGRESS = re.compile(r'\[(\d+)[/\\](\d+)\]')
+
+
 def _detect_metrics(line: str) -> Optional[Dict[str, float]]:
     line = line.strip()
     if not line:
         return None
+    # JSON lines
     if line.startswith('{') and line.endswith('}'):
         try:
             data = json.loads(line)
@@ -592,10 +661,10 @@ def _detect_metrics(line: str) -> Optional[Dict[str, float]]:
             return result or None
         except Exception:
             pass
-    if not _METRIC_KW.search(line):
-        return None
+    # Key=value parsing: any line with 2+ numeric key=value pairs is a metric line.
+    # No keyword filter — domain-specific keys like recon, paddle, ball are valid.
     pairs = _KV.findall(line)
-    if not pairs:
+    if len(pairs) < 2:
         return None
     result = {}
     for name, val in pairs:
@@ -603,6 +672,11 @@ def _detect_metrics(line: str) -> Optional[Dict[str, float]]:
             result[name] = float(val)
         except ValueError:
             pass
+    # Extract step from [current/total] progress pattern
+    progress_match = _PROGRESS.search(line)
+    if progress_match:
+        result['_step'] = int(progress_match.group(1))
+        result['_total'] = int(progress_match.group(2))
     return result or None
 
 

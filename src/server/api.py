@@ -5,6 +5,7 @@ PyTorchRunner FastAPI Server
 import asyncio
 import uuid
 from datetime import datetime
+from time import time as _time
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -46,6 +47,22 @@ class HealthStatus(BaseModel):
     mps_memory_used: Optional[int] = None
     queue_size: int
     active_jobs: int
+
+
+class RunnerInfo(BaseModel):
+    """Worker runner registration / heartbeat payload"""
+    id: str
+    hostname: str
+    namespace: str = "default"
+    gpu_type: Optional[str] = None
+    capabilities: Dict[str, Any] = {}
+    status: str = "idle"
+    current_job: Optional[str] = None
+
+
+# In-memory runner registry: runner_id → registration dict + last_seen timestamp
+_runner_registry: Dict[str, Any] = {}
+_RUNNER_STALE_SECONDS = 90
 
 
 # Initialize FastAPI app
@@ -160,6 +177,48 @@ async def health_check() -> HealthStatus:
         queue_size=queue_size,
         active_jobs=active_jobs
     )
+
+
+@app.post("/api/runners", status_code=200)
+async def register_runner(info: RunnerInfo) -> Dict[str, bool]:
+    """
+    Register or heartbeat a worker runner. Called by mlx_runner on startup and every 30s.
+    """
+    _runner_registry[info.id] = {
+        **info.dict(),
+        "last_seen": _time(),
+    }
+    return {"ok": True}
+
+
+@app.get("/api/runners")
+async def list_runners():
+    """
+    List all known runners. Runners with last_seen > 90s ago are reported as offline.
+    Stale entries are pruned after 5 minutes.
+    """
+    now = _time()
+    result = []
+    stale_keys = []
+    for runner_id, runner in list(_runner_registry.items()):
+        age = now - runner.get("last_seen", 0)
+        if age > 300:
+            stale_keys.append(runner_id)
+            continue
+        status = "offline" if age > _RUNNER_STALE_SECONDS else runner.get("status", "idle")
+        result.append({**runner, "status": status, "last_seen_age_seconds": round(age)})
+    for key in stale_keys:
+        _runner_registry.pop(key, None)
+    return result
+
+
+@app.delete("/api/runners/{runner_id}", status_code=200)
+async def deregister_runner(runner_id: str) -> Dict[str, bool]:
+    """
+    Deregister a runner on clean shutdown.
+    """
+    _runner_registry.pop(runner_id, None)
+    return {"ok": True}
 
 
 async def process_training_job(job_id: str):
